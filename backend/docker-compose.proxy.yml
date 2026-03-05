@@ -1,0 +1,31 @@
+services:
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    container_name: baseful-proxy
+    ports:
+      - "6432:6432"
+    networks:
+      - baseful-network
+    env_file:
+      - .env
+    environment:
+      - PROXY_PORT=6432
+      - DB_READ_ONLY=true
+      - PROXY_ONLY=true
+      - DB_PATH=/app/data/data.db
+    volumes:
+      - .:/app/data:ro
+      - ./server.crt:/app/server.crt:ro
+      - ./server.key:/app/server.key:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "6432"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  baseful-network:
+    external: true
