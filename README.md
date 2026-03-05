@@ -1,5 +1,7 @@
 # Baseful
 
+![Baseful preview](https://raw.githubusercontent.com/getbaseful/baseful/refs/heads/main/preview.png)
+
 Baseful is an open-source, self-hostable platform for managing PostgreSQL databases, inspired by the developer experience of Neon.
 
 It gives you a web dashboard, a built-in Postgres proxy with token-based auth, backup workflows, monitoring, and container lifecycle management on your own infrastructure.
