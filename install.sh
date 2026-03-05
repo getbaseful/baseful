@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Baseful Installation Script
-# Usage: curl -sSL https://raw.githubusercontent.com/tobiasrasmsn/baseful/main/install.sh | bash
+# Usage: curl -sSL https://raw.githubusercontent.com/getbaseful/baseful/refs/heads/main/install.sh | bash
 # Update mode: ... | bash -s -- update
 # Works for both root and non-root users (non-root requires sudo access).
 
@@ -9,7 +9,7 @@ set -e
 
 # --- Configuration ---
 INSTALL_DIR="/opt/baseful"
-GITHUB_REPO="https://github.com/tobiasrasmsn/baseful.git"
+GITHUB_REPO="https://github.com/getbaseful/baseful.git"
 
 # --- Mode flags ---
 UPDATE_MODE=0
