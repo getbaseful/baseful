@@ -28,7 +28,6 @@ import { useAuth } from "@/context/AuthContext";
 import { authFetch } from "@/lib/api";
 import { ManageProjectDialog } from "@/components/ManageProjectDialog";
 import { DitherAvatar } from "@/components/ui/hash-avatar";
-import { FacehashSVG } from "@/components/FacehashSVG";
 
 interface ContainerInfo {
   id: string;
@@ -1280,22 +1279,24 @@ export default function Containers() {
                         >
                           <div className="w-full h-full p-2.5 flex items-center justify-center">
                             <div
-                              className={`w-[220px] h-[150px] rounded-[10px] border flex flex-col select-none transition-colors overflow-hidden ${isSelected
-                                ? "bg-neutral-800 border-neutral-500 shadow-xl"
-                                : isRelated
-                                  ? "bg-[#181818] border-neutral-600 shadow-md"
-                                  : "bg-[#121212] border-[#2a2a2a] shadow-md hover:border-[#3e3e3e]"
-                                }`}
+                              className={`w-[220px] h-[150px] rounded-[10px] border flex flex-col select-none transition-colors overflow-hidden ${
+                                isSelected
+                                  ? "bg-neutral-800 border-neutral-500 shadow-xl"
+                                  : isRelated
+                                    ? "bg-[#181818] border-neutral-600 shadow-md"
+                                    : "bg-[#121212] border-[#2a2a2a] shadow-md hover:border-[#3e3e3e]"
+                              }`}
                               onClick={() => {
                                 if (panStateRef.current.moved) return;
                                 setSelectedNodeId(node.id);
                               }}
                             >
                               <div
-                                className={`flex items-center gap-2.5 px-3 h-[34px] border-b ${isSelected
-                                  ? "border-neutral-600"
-                                  : "border-[#2a2a2a]"
-                                  }`}
+                                className={`flex items-center gap-2.5 px-3 h-[34px] border-b ${
+                                  isSelected
+                                    ? "border-neutral-600"
+                                    : "border-[#2a2a2a]"
+                                }`}
                               >
                                 <div className="flex-shrink-0 flex items-center justify-center">
                                   {iconNode}
@@ -1361,10 +1362,10 @@ export default function Containers() {
                                       ))}
                                       {(!node.users ||
                                         node.users.length === 0) && (
-                                          <span className="text-[10px] text-neutral-500 italic">
-                                            No members assigned
-                                          </span>
-                                        )}
+                                        <span className="text-[10px] text-neutral-500 italic">
+                                          No members assigned
+                                        </span>
+                                      )}
                                     </div>
                                   </div>
                                 ) : node.kind === "network" ? (
@@ -1392,10 +1393,11 @@ export default function Containers() {
                               </div>
                               {(isContainer || node.kind === "project") && (
                                 <div
-                                  className={`flex items-center justify-end px-3 h-[40px] border-t ${isSelected
-                                    ? "border-neutral-600"
-                                    : "border-[#2a2a2a]"
-                                    }`}
+                                  className={`flex items-center justify-end px-3 h-[40px] border-t ${
+                                    isSelected
+                                      ? "border-neutral-600"
+                                      : "border-[#2a2a2a]"
+                                  }`}
                                 >
                                   <Button
                                     size="sm"
