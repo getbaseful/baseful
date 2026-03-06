@@ -10,7 +10,7 @@ import { Input } from "@/components/ui/input";
 import { useAuth } from "@/context/AuthContext";
 import { authFetch } from "@/lib/api";
 import { toast } from "sonner";
-import { Facehash } from "facehash";
+import { FacehashSVG } from "@/components/FacehashSVG";
 
 interface User {
     id: number;
@@ -186,15 +186,9 @@ export function ManageProjectDialog({
                                                     {u.avatarUrl ? (
                                                         <img src={u.avatarUrl} className="size-full object-cover" alt="" />
                                                     ) : (
-                                                        <Facehash
+                                                        <FacehashSVG
                                                             name={u.email}
                                                             size={24}
-                                                            colorClasses={[
-                                                                "bg-orange-600",
-                                                                "bg-blue-600",
-                                                                "bg-lime-600",
-                                                                "bg-purple-600",
-                                                            ]}
                                                         />
                                                     )}
                                                 </div>
@@ -222,15 +216,9 @@ export function ManageProjectDialog({
                                                 {u.avatarUrl ? (
                                                     <img src={u.avatarUrl} className="size-full object-cover" alt="" />
                                                 ) : (
-                                                    <Facehash
+                                                    <FacehashSVG
                                                         name={u.email}
                                                         size={24}
-                                                        colorClasses={[
-                                                            "bg-orange-600",
-                                                            "bg-blue-600",
-                                                            "bg-lime-600",
-                                                            "bg-purple-600",
-                                                        ]}
                                                     />
                                                 )}
                                             </div>

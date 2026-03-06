@@ -28,6 +28,7 @@ import { useAuth } from "@/context/AuthContext";
 import { authFetch } from "@/lib/api";
 import { ManageProjectDialog } from "@/components/ManageProjectDialog";
 import { DitherAvatar } from "@/components/ui/hash-avatar";
+import { FacehashSVG } from "@/components/FacehashSVG";
 
 interface ContainerInfo {
   id: string;
@@ -104,17 +105,18 @@ function inferProjectName(
 ): string {
   const basefulProjectId = labels["baseful.project_id"];
   if (basefulProjectId && basefulProjectId !== "0") {
-    return (
-      projectsById[basefulProjectId]?.name || `Project ${basefulProjectId}`
-    );
+    const name =
+      projectsById[basefulProjectId]?.name || `Project ${basefulProjectId}`;
+    return name.toLowerCase() === "baseful" ? "Baseful" : name;
   }
 
-  return (
+  const name =
     labels["com.docker.compose.project"] ||
     labels["com.docker.stack.namespace"] ||
     labels["project"] ||
-    "unassigned"
-  );
+    "unassigned";
+
+  return name.toLowerCase() === "baseful" ? "Baseful" : name;
 }
 
 function inferSubnet(ip: string): string {
@@ -280,13 +282,22 @@ function buildTopology(
     );
     const users = projectInfo ? projectInfo[1].users : undefined;
 
+    let label = project;
+    let finalUsers = users;
+
+    if (project.toLowerCase() === "baseful") {
+      label = "Baseful";
+      // Specific single user for baseful project avatar
+      finalUsers = [{ id: 0, email: "baseful@system", avatarUrl: "/logo.png" }];
+    }
+
     nodes.push({
       id: `project:${project}`,
       kind: "project",
-      label: project,
+      label: label,
       detail: "project",
       color: "#2f4f4f",
-      users: users,
+      users: finalUsers,
       x: xByKind.project,
       y: currentY,
     });
@@ -845,7 +856,7 @@ export default function Containers() {
     };
 
     const handleGEnd = (e: any) => e.preventDefault();
-    const handleTouchMove = (e: any) => e.preventDefault();
+    const handleTouchMove = (e: TouchEvent) => e.preventDefault();
 
     element.addEventListener("wheel", handleWheel, { passive: false });
     element.addEventListener("gesturestart", handleGStart, { passive: false });
@@ -883,6 +894,41 @@ export default function Containers() {
     if (!panStateRef.current.active) return;
     const dx = e.clientX - panStateRef.current.pointerStartX;
     const dy = e.clientY - panStateRef.current.pointerStartY;
+
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+      panStateRef.current.moved = true;
+    }
+
+    setViewport((prev) => ({
+      ...prev,
+      x: panStateRef.current.viewportStartX + dx,
+      y: panStateRef.current.viewportStartY + dy,
+    }));
+  };
+
+  const handleMapTouchStart = (e: React.TouchEvent<SVGSVGElement>) => {
+    if (e.touches.length !== 1) return;
+    const touch = e.touches[0];
+
+    if (e.target === e.currentTarget) {
+      setSelectedNodeId(null);
+    }
+    panStateRef.current = {
+      active: true,
+      moved: false,
+      pointerStartX: touch.clientX,
+      pointerStartY: touch.clientY,
+      viewportStartX: viewport.x,
+      viewportStartY: viewport.y,
+    };
+    setIsPanning(true);
+  };
+
+  const handleMapTouchMove = (e: React.TouchEvent<SVGSVGElement>) => {
+    if (!panStateRef.current.active || e.touches.length !== 1) return;
+    const touch = e.touches[0];
+    const dx = touch.clientX - panStateRef.current.pointerStartX;
+    const dy = touch.clientY - panStateRef.current.pointerStartY;
 
     if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
       panStateRef.current.moved = true;
@@ -1123,6 +1169,10 @@ export default function Containers() {
                 onMouseMove={handleMapMouseMove}
                 onMouseUp={endMapPan}
                 onMouseLeave={endMapPan}
+                onTouchStart={handleMapTouchStart}
+                onTouchMove={handleMapTouchMove}
+                onTouchEnd={endMapPan}
+                onTouchCancel={endMapPan}
               >
                 <defs>
                   <pattern
@@ -1230,24 +1280,22 @@ export default function Containers() {
                         >
                           <div className="w-full h-full p-2.5 flex items-center justify-center">
                             <div
-                              className={`w-[220px] h-[150px] rounded-[10px] border flex flex-col select-none transition-colors overflow-hidden ${
-                                isSelected
-                                  ? "bg-neutral-800 border-neutral-500 shadow-xl"
-                                  : isRelated
-                                    ? "bg-[#181818] border-neutral-600 shadow-md"
-                                    : "bg-[#121212] border-[#2a2a2a] shadow-md hover:border-[#3e3e3e]"
-                              }`}
+                              className={`w-[220px] h-[150px] rounded-[10px] border flex flex-col select-none transition-colors overflow-hidden ${isSelected
+                                ? "bg-neutral-800 border-neutral-500 shadow-xl"
+                                : isRelated
+                                  ? "bg-[#181818] border-neutral-600 shadow-md"
+                                  : "bg-[#121212] border-[#2a2a2a] shadow-md hover:border-[#3e3e3e]"
+                                }`}
                               onClick={() => {
                                 if (panStateRef.current.moved) return;
                                 setSelectedNodeId(node.id);
                               }}
                             >
                               <div
-                                className={`flex items-center gap-2.5 px-3 h-[34px] border-b ${
-                                  isSelected
-                                    ? "border-neutral-600"
-                                    : "border-[#2a2a2a]"
-                                }`}
+                                className={`flex items-center gap-2.5 px-3 h-[34px] border-b ${isSelected
+                                  ? "border-neutral-600"
+                                  : "border-[#2a2a2a]"
+                                  }`}
                               >
                                 <div className="flex-shrink-0 flex items-center justify-center">
                                   {iconNode}
@@ -1313,10 +1361,10 @@ export default function Containers() {
                                       ))}
                                       {(!node.users ||
                                         node.users.length === 0) && (
-                                        <span className="text-[10px] text-neutral-500 italic">
-                                          No members assigned
-                                        </span>
-                                      )}
+                                          <span className="text-[10px] text-neutral-500 italic">
+                                            No members assigned
+                                          </span>
+                                        )}
                                     </div>
                                   </div>
                                 ) : node.kind === "network" ? (
@@ -1344,11 +1392,10 @@ export default function Containers() {
                               </div>
                               {(isContainer || node.kind === "project") && (
                                 <div
-                                  className={`flex items-center justify-end px-3 h-[40px] border-t ${
-                                    isSelected
-                                      ? "border-neutral-600"
-                                      : "border-[#2a2a2a]"
-                                  }`}
+                                  className={`flex items-center justify-end px-3 h-[40px] border-t ${isSelected
+                                    ? "border-neutral-600"
+                                    : "border-[#2a2a2a]"
+                                    }`}
                                 >
                                   <Button
                                     size="sm"
