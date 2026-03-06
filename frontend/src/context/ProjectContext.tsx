@@ -66,8 +66,17 @@ export function ProjectProvider({ children }: ProjectProviderProps) {
         );
         if (projectFromUrl) {
           setSelectedProject(projectFromUrl);
+        } else {
+          setSelectedProject(projectsList.length > 0 ? projectsList[0] : null);
         }
-      } else if (projectsList.length > 0 && !selectedProject) {
+      } else if (selectedProject) {
+        const stillAccessible = projectsList.find(
+          (p: Project) => p.id === selectedProject.id,
+        );
+        if (!stillAccessible) {
+          setSelectedProject(projectsList.length > 0 ? projectsList[0] : null);
+        }
+      } else if (projectsList.length > 0) {
         setSelectedProject(projectsList[0]);
       }
     } catch (error) {

@@ -11,13 +11,14 @@ export async function authFetch(
         ...options.headers,
     } as Record<string, string>;
 
-    if (token) {
+    if (token && token !== "__cookie_session__") {
         headers["Authorization"] = `Bearer ${token}`;
     }
 
     const response = await fetch(url, {
         ...options,
         headers,
+        credentials: "include",
     });
 
     if (response.status === 401 && onUnauthorized) {

@@ -117,10 +117,12 @@ func GenerateUserJWT(userID int, email string, isAdmin bool) (string, error) {
 func ValidateJWT(tokenString string) (*JWTClaims, error) {
 	secret := GetJWTSecret()
 
-	token, err := jwt.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-		}
+	parser := jwt.NewParser(
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithIssuer("baseful"),
+		jwt.WithLeeway(30*time.Second),
+	)
+	token, err := parser.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
 		return []byte(secret), nil
 	})
 

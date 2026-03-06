@@ -12,6 +12,8 @@ import WebServer from "./pages/WebServer";
 import Branches from "./pages/branches/Branches";
 import Backup from "./pages/Backup";
 import Security from "./pages/Security";
+import Notifications from "./pages/Notifications";
+import DatabaseNotifications from "./pages/DatabaseNotifications";
 import Users from "./pages/Users";
 import Login from "./pages/Login";
 import Register from "./pages/Register";
@@ -20,6 +22,7 @@ import AuthLayout from "./components/auth/AuthLayout";
 import Sidebar from "./components/dashboard/sidebar";
 import MobileDock from "./components/dashboard/MobileDock";
 import UpdateOverlay from "./components/dashboard/UpdateOverlay";
+import { Toaster } from "./components/ui/sonner";
 import { ThemeProvider } from "./components/theme-provider";
 import { DatabaseProvider } from "./context/DatabaseContext";
 import { ProjectProvider } from "./context/ProjectContext";
@@ -46,6 +49,7 @@ function App() {
                   element={
                     <AuthGuard>
                       <UpdateOverlay />
+                      <Toaster richColors />
                       <div className="bg-background h-dvh w-full flex flex-row">
                         {/* Desktop Sidebar - hidden on mobile */}
                         <div className="hidden md:block">
@@ -101,6 +105,14 @@ function App() {
                                 element={<WebServer />}
                               />
                               <Route path="/web-server" element={<WebServer />} />
+                              <Route
+                                path="/db/:id/notifications"
+                                element={<DatabaseNotifications />}
+                              />
+                              <Route
+                                path="/notifications"
+                                element={<Notifications />}
+                              />
                               <Route
                                 path="/db/:id/backup"
                                 element={<Backup />}

@@ -35,6 +35,11 @@ import (
 	"baseful/system"
 )
 
+const (
+	sessionCookieName      = "baseful_session"
+	sessionCookieMaxAgeSec = 7 * 24 * 60 * 60
+)
+
 func getFreePort() (int, error) {
 	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
 	if err != nil {
@@ -87,6 +92,39 @@ func sanitizeSQLResponse(raw string) string {
 		sqlText = strings.TrimSpace(sqlText[4:])
 	}
 	return sqlText
+}
+
+func isSecureRequest(c *gin.Context) bool {
+	if c.Request.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https")
+}
+
+func setSessionCookie(c *gin.Context, token string) {
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(
+		sessionCookieName,
+		token,
+		sessionCookieMaxAgeSec,
+		"/",
+		"",
+		isSecureRequest(c),
+		true,
+	)
+}
+
+func clearSessionCookie(c *gin.Context) {
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(
+		sessionCookieName,
+		"",
+		-1,
+		"/",
+		"",
+		isSecureRequest(c),
+		true,
+	)
 }
 
 func fetchSchemaSummary(ctx context.Context, cli *client.Client, containerID, dbName string) (string, error) {
@@ -145,6 +183,76 @@ func fetchSchemaSummary(ctx context.Context, cli *client.Client, containerID, db
 		return summary[:12000], nil
 	}
 	return summary, nil
+}
+
+func requireProjectAccess(c *gin.Context, projectID int) bool {
+	isAdmin := c.MustGet("is_admin").(bool)
+	if isAdmin {
+		return true
+	}
+
+	userID := c.MustGet("user_id").(int)
+	allowed, err := db.UserCanAccessProject(userID, projectID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to validate project access"})
+		return false
+	}
+	if !allowed {
+		c.JSON(403, gin.H{"error": "Access denied for this project"})
+		return false
+	}
+
+	return true
+}
+
+func getUserPermissionsForResponse(userID int, isAdmin bool) []string {
+	if isAdmin {
+		return db.AvailablePermissionKeys
+	}
+	permissions, err := db.GetUserPermissions(userID)
+	if err != nil {
+		return []string{}
+	}
+	return permissions
+}
+
+func requirePermission(c *gin.Context, permission string) bool {
+	isAdmin := c.MustGet("is_admin").(bool)
+	if isAdmin {
+		return true
+	}
+
+	userID := c.MustGet("user_id").(int)
+	allowed, err := db.UserHasPermission(userID, permission)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to validate permissions"})
+		return false
+	}
+	if !allowed {
+		c.JSON(403, gin.H{"error": "Permission denied"})
+		return false
+	}
+	return true
+}
+
+func requireDatabaseAccess(c *gin.Context, databaseID int) bool {
+	isAdmin := c.MustGet("is_admin").(bool)
+	if isAdmin {
+		return true
+	}
+
+	userID := c.MustGet("user_id").(int)
+	allowed, err := db.UserCanAccessDatabase(userID, databaseID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to validate database access"})
+		return false
+	}
+	if !allowed {
+		c.JSON(403, gin.H{"error": "Access denied for this database"})
+		return false
+	}
+
+	return true
 }
 
 func requestSQLFromOpenRouter(apiKey, systemPrompt, userPrompt string) (string, error) {
@@ -327,6 +435,13 @@ func main() {
 		}
 
 		if user == nil || !db.CheckPasswordHash(req.Password, user.PasswordHash) {
+			system.NotifyGlobalEventAsync(
+				db.NotificationEventAuthLoginFailed,
+				"Baseful auth: login failed",
+				fmt.Sprintf("Failed login attempt for email %s from IP %s at %s", req.Email, c.ClientIP(), time.Now().Format(time.RFC3339)),
+				2*time.Minute,
+				req.Email,
+			)
 			c.JSON(401, gin.H{"error": "Invalid email or password"})
 			return
 		}
@@ -336,15 +451,18 @@ func main() {
 			c.JSON(500, gin.H{"error": "Failed to generate session"})
 			return
 		}
+		setSessionCookie(c, token)
+		permissions := getUserPermissionsForResponse(user.ID, user.IsAdmin)
 
 		c.JSON(200, gin.H{
 			"token": token,
 			"user": gin.H{
-				"id":        user.ID,
-				"email":     user.Email,
-				"firstName": user.FirstName,
-				"lastName":  user.LastName,
-				"isAdmin":   user.IsAdmin,
+				"id":          user.ID,
+				"email":       user.Email,
+				"firstName":   user.FirstName,
+				"lastName":    user.LastName,
+				"isAdmin":     user.IsAdmin,
+				"permissions": permissions,
 			},
 		})
 	})
@@ -381,6 +499,13 @@ func main() {
 				return
 			}
 			if !whitelisted {
+				system.NotifyGlobalEventAsync(
+					db.NotificationEventAuthRegisterBlocked,
+					"Baseful auth: signup blocked",
+					fmt.Sprintf("Signup blocked for non-whitelisted email %s from IP %s at %s", req.Email, c.ClientIP(), time.Now().Format(time.RFC3339)),
+					2*time.Minute,
+					req.Email,
+				)
 				c.JSON(403, gin.H{"error": "This email is not whitelisted"})
 				return
 			}
@@ -394,14 +519,24 @@ func main() {
 		}
 
 		token, _ := auth.GenerateUserJWT(userID, req.Email, isAdmin)
+		setSessionCookie(c, token)
+		permissions := getUserPermissionsForResponse(userID, isAdmin)
+		system.NotifyGlobalEventAsync(
+			db.NotificationEventAuthRegisterSuccess,
+			"Baseful auth: account created",
+			fmt.Sprintf("Account created for %s at %s", req.Email, time.Now().Format(time.RFC3339)),
+			time.Minute,
+			req.Email,
+		)
 		c.JSON(201, gin.H{
 			"token": token,
 			"user": gin.H{
-				"id":        userID,
-				"email":     req.Email,
-				"firstName": req.FirstName,
-				"lastName":  req.LastName,
-				"isAdmin":   isAdmin,
+				"id":          userID,
+				"email":       req.Email,
+				"firstName":   req.FirstName,
+				"lastName":    req.LastName,
+				"isAdmin":     isAdmin,
+				"permissions": permissions,
 			},
 		})
 	})
@@ -414,6 +549,11 @@ func main() {
 			return
 		}
 		c.JSON(200, gin.H{"message": "All users deleted. You can now setup a new admin."})
+	})
+
+	r.POST("/api/auth/logout", func(c *gin.Context) {
+		clearSessionCookie(c)
+		c.JSON(200, gin.H{"message": "Logged out"})
 	})
 
 	// ========== STATIC ASSETS & PUBLIC ROUTES ==========
@@ -445,14 +585,22 @@ func main() {
 			c.JSON(404, gin.H{"error": "User not found"})
 			return
 		}
+		// Migration support: if client authenticated with Bearer token, also issue HttpOnly cookie.
+		authHeader := c.GetHeader("Authorization")
+		parts := strings.Fields(authHeader)
+		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") && parts[1] != "" {
+			setSessionCookie(c, parts[1])
+		}
+		permissions := getUserPermissionsForResponse(user.ID, user.IsAdmin)
 
 		c.JSON(200, gin.H{
-			"id":        user.ID,
-			"email":     user.Email,
-			"firstName": user.FirstName,
-			"lastName":  user.LastName,
-			"isAdmin":   user.IsAdmin,
-			"avatarUrl": user.AvatarURL,
+			"id":          user.ID,
+			"email":       user.Email,
+			"firstName":   user.FirstName,
+			"lastName":    user.LastName,
+			"isAdmin":     user.IsAdmin,
+			"avatarUrl":   user.AvatarURL,
+			"permissions": permissions,
 		})
 	})
 
@@ -622,16 +770,223 @@ func main() {
 		c.JSON(200, gin.H{"message": "Email removed from whitelist"})
 	})
 
+	// List users (Admin only)
+	r.GET("/api/auth/users", auth.AdminOnly(), func(c *gin.Context) {
+		users, err := db.GetAllUsers()
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to query users"})
+			return
+		}
+		c.JSON(200, users)
+	})
+
+	// Get project access for a user (Admin only)
+	r.GET("/api/auth/users/:id/project-access", auth.AdminOnly(), func(c *gin.Context) {
+		userID, err := strconv.Atoi(c.Param("id"))
+		if err != nil || userID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid user ID"})
+			return
+		}
+
+		user, err := db.GetUserByID(userID)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to query user"})
+			return
+		}
+		if user == nil {
+			c.JSON(404, gin.H{"error": "User not found"})
+			return
+		}
+
+		projectIDs, err := db.GetUserProjectAccess(userID)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to query user project access"})
+			return
+		}
+
+		c.JSON(200, gin.H{"projectIds": projectIDs})
+	})
+
+	// Replace project access for a user (Admin only)
+	r.PUT("/api/auth/users/:id/project-access", auth.AdminOnly(), func(c *gin.Context) {
+		userID, err := strconv.Atoi(c.Param("id"))
+		if err != nil || userID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid user ID"})
+			return
+		}
+
+		user, err := db.GetUserByID(userID)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to query user"})
+			return
+		}
+		if user == nil {
+			c.JSON(404, gin.H{"error": "User not found"})
+			return
+		}
+
+		var req struct {
+			ProjectIDs []int `json:"projectIds"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid request body"})
+			return
+		}
+
+		for _, projectID := range req.ProjectIDs {
+			if projectID <= 0 {
+				c.JSON(400, gin.H{"error": "Project IDs must be positive integers"})
+				return
+			}
+			var count int
+			if err := db.DB.QueryRow("SELECT COUNT(*) FROM projects WHERE id = ?", projectID).Scan(&count); err != nil {
+				c.JSON(500, gin.H{"error": "Failed to validate project IDs"})
+				return
+			}
+			if count == 0 {
+				c.JSON(400, gin.H{"error": fmt.Sprintf("Project %d does not exist", projectID)})
+				return
+			}
+		}
+
+		if err := db.SetUserProjectAccess(userID, req.ProjectIDs); err != nil {
+			c.JSON(500, gin.H{"error": "Failed to update project access"})
+			return
+		}
+
+		c.JSON(200, gin.H{"message": "Project access updated"})
+	})
+
+	// Get list of available permission keys (Admin only)
+	r.GET("/api/auth/permissions", auth.AdminOnly(), func(c *gin.Context) {
+		c.JSON(200, gin.H{"permissions": db.AvailablePermissionKeys})
+	})
+
+	// Get permissions for a user (Admin only)
+	r.GET("/api/auth/users/:id/permissions", auth.AdminOnly(), func(c *gin.Context) {
+		userID, err := strconv.Atoi(c.Param("id"))
+		if err != nil || userID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid user ID"})
+			return
+		}
+
+		user, err := db.GetUserByID(userID)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to query user"})
+			return
+		}
+		if user == nil {
+			c.JSON(404, gin.H{"error": "User not found"})
+			return
+		}
+
+		permissions := getUserPermissionsForResponse(userID, user.IsAdmin)
+		c.JSON(200, gin.H{"permissions": permissions})
+	})
+
+	// Replace permissions for a user (Admin only)
+	r.PUT("/api/auth/users/:id/permissions", auth.AdminOnly(), func(c *gin.Context) {
+		userID, err := strconv.Atoi(c.Param("id"))
+		if err != nil || userID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid user ID"})
+			return
+		}
+
+		user, err := db.GetUserByID(userID)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to query user"})
+			return
+		}
+		if user == nil {
+			c.JSON(404, gin.H{"error": "User not found"})
+			return
+		}
+		if user.IsAdmin {
+			c.JSON(400, gin.H{"error": "Admin users always have full permissions"})
+			return
+		}
+
+		var req struct {
+			Permissions []string `json:"permissions"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid request body"})
+			return
+		}
+
+		for _, permission := range req.Permissions {
+			if !db.IsValidPermissionKey(permission) {
+				c.JSON(400, gin.H{"error": fmt.Sprintf("Unknown permission: %s", permission)})
+				return
+			}
+		}
+
+		if err := db.SetUserPermissions(userID, req.Permissions); err != nil {
+			c.JSON(500, gin.H{"error": "Failed to update permissions"})
+			return
+		}
+
+		c.JSON(200, gin.H{"message": "Permissions updated"})
+	})
+
+	// Delete user (Admin only) - "Kick user"
+	r.DELETE("/api/auth/users/:id", auth.AdminOnly(), func(c *gin.Context) {
+		userID, err := strconv.Atoi(c.Param("id"))
+		if err != nil || userID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid user ID"})
+			return
+		}
+
+		requesterID := c.MustGet("user_id").(int)
+		if requesterID == userID {
+			c.JSON(400, gin.H{"error": "You cannot remove your own account"})
+			return
+		}
+
+		targetUser, err := db.GetUserByID(userID)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to query user"})
+			return
+		}
+		if targetUser == nil {
+			c.JSON(404, gin.H{"error": "User not found"})
+			return
+		}
+
+		var adminCount int
+		if err := db.DB.QueryRow("SELECT COUNT(*) FROM users WHERE is_admin = 1").Scan(&adminCount); err != nil {
+			c.JSON(500, gin.H{"error": "Failed to validate admin count"})
+			return
+		}
+		if targetUser.IsAdmin && adminCount <= 1 {
+			c.JSON(400, gin.H{"error": "Cannot remove the last admin user"})
+			return
+		}
+
+		if err := db.DeleteUserByID(userID); err != nil {
+			c.JSON(500, gin.H{"error": "Failed to remove user"})
+			return
+		}
+
+		c.JSON(200, gin.H{"message": "User removed successfully"})
+	})
+
 	r.GET("/api/hello", func(c *gin.Context) {
 		c.JSON(200, gin.H{"message": "Baseful API is running"})
 	})
 
 	r.GET("/api/system/update-status", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
 		c.JSON(200, system.GetUpdateStatus())
 	})
 
 	// Web Server Endpoints
 	r.GET("/api/system/webserver/status", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
 		info, err := system.GetDomainInfo()
 		if err != nil {
 			c.JSON(500, gin.H{"error": err.Error()})
@@ -641,6 +996,9 @@ func main() {
 	})
 
 	r.POST("/api/system/webserver/domain", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
 		var req struct {
 			Domain string `json:"domain"`
 		}
@@ -656,6 +1014,9 @@ func main() {
 	})
 
 	r.GET("/api/system/webserver/check-dns", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
 		domain, _ := db.GetSetting("domain_name")
 		if domain == "" {
 			c.JSON(400, gin.H{"error": "No domain configured"})
@@ -670,6 +1031,9 @@ func main() {
 	})
 
 	r.POST("/api/system/webserver/provision-ssl", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
 		domain, _ := db.GetSetting("domain_name")
 		if domain == "" {
 			c.JSON(400, gin.H{"error": "No domain configured"})
@@ -684,6 +1048,9 @@ func main() {
 
 	// Get monitoring settings
 	r.GET("/api/settings", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
 		enabled, _ := db.GetSetting("metrics_enabled")
 		rateStr, _ := db.GetSetting("metrics_sample_rate")
 		rate, _ := strconv.Atoi(rateStr)
@@ -695,6 +1062,9 @@ func main() {
 
 	// Update monitoring settings
 	r.POST("/api/settings", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
 		var req struct {
 			MetricsEnabled    bool   `json:"metrics_enabled"`
 			MetricsSampleRate string `json:"metrics_sample_rate"`
@@ -715,12 +1085,287 @@ func main() {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
 
+	r.GET("/api/system/notifications", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionManageNotifications) {
+			return
+		}
+		settings, err := db.GetNotificationSettings()
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to fetch notification settings"})
+			return
+		}
+
+		c.JSON(200, settings)
+	})
+
+	r.PUT("/api/system/notifications", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionManageNotifications) {
+			return
+		}
+		var req db.NotificationSettings
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid request body"})
+			return
+		}
+
+		if req.SMTPPort <= 0 {
+			req.SMTPPort = 587
+		}
+		if req.SMTPPort < 1 || req.SMTPPort > 65535 {
+			c.JSON(400, gin.H{"error": "SMTP port must be between 1 and 65535"})
+			return
+		}
+
+		if err := db.UpdateNotificationSettings(req); err != nil {
+			c.JSON(500, gin.H{"error": "Failed to save notification settings"})
+			return
+		}
+
+		c.JSON(200, gin.H{"message": "Notification settings saved"})
+	})
+
+	r.GET("/api/system/notifications/master", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionManageNotifications) {
+			return
+		}
+		enabled, err := db.IsNotificationsMasterEnabled()
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to fetch notifications master setting"})
+			return
+		}
+		c.JSON(200, gin.H{"enabled": enabled})
+	})
+
+	r.PUT("/api/system/notifications/master", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionManageNotifications) {
+			return
+		}
+		var req struct {
+			Enabled bool `json:"enabled"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid request body"})
+			return
+		}
+		if err := db.SetNotificationsMasterEnabled(req.Enabled); err != nil {
+			c.JSON(500, gin.H{"error": "Failed to update notifications master setting"})
+			return
+		}
+		c.JSON(200, gin.H{"enabled": req.Enabled})
+	})
+
+	r.GET("/api/system/notification-preferences", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionManageNotifications) {
+			return
+		}
+		prefs, err := db.GetGlobalNotificationPreferences()
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to fetch global notification preferences"})
+			return
+		}
+		c.JSON(200, prefs)
+	})
+
+	r.PUT("/api/system/notification-preferences", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionManageNotifications) {
+			return
+		}
+		var req map[string]bool
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid request body"})
+			return
+		}
+
+		if err := db.UpsertGlobalNotificationPreferences(req); err != nil {
+			c.JSON(500, gin.H{"error": "Failed to save global notification preferences"})
+			return
+		}
+
+		prefs, err := db.GetGlobalNotificationPreferences()
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to fetch updated global notification preferences"})
+			return
+		}
+		c.JSON(200, prefs)
+	})
+
+	r.GET("/api/databases/:id/notification-preferences", func(c *gin.Context) {
+		id, err := strconv.Atoi(c.Param("id"))
+		if err != nil {
+			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, id) {
+			return
+		}
+		if !requirePermission(c, db.PermissionManageNotifications) {
+			return
+		}
+
+		var count int
+		if err := db.DB.QueryRow("SELECT COUNT(*) FROM databases WHERE id = ?", id).Scan(&count); err != nil || count == 0 {
+			c.JSON(404, gin.H{"error": "Database not found"})
+			return
+		}
+
+		prefs, err := db.GetDatabaseNotificationPreferences(id)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to fetch notification preferences"})
+			return
+		}
+		c.JSON(200, prefs)
+	})
+
+	r.PUT("/api/databases/:id/notification-preferences", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionManageNotifications) {
+			return
+		}
+		masterEnabled, err := db.IsNotificationsMasterEnabled()
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to read notifications master setting"})
+			return
+		}
+		if !masterEnabled {
+			c.JSON(403, gin.H{"error": "Notifications are disabled by master toggle. Enable notifications in Server Notification Center first."})
+			return
+		}
+
+		id, err := strconv.Atoi(c.Param("id"))
+		if err != nil {
+			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, id) {
+			return
+		}
+
+		var count int
+		if err := db.DB.QueryRow("SELECT COUNT(*) FROM databases WHERE id = ?", id).Scan(&count); err != nil || count == 0 {
+			c.JSON(404, gin.H{"error": "Database not found"})
+			return
+		}
+
+		var req map[string]bool
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid request body"})
+			return
+		}
+
+		if err := db.UpsertDatabaseNotificationPreferences(id, req); err != nil {
+			c.JSON(500, gin.H{"error": "Failed to save notification preferences"})
+			return
+		}
+
+		prefs, err := db.GetDatabaseNotificationPreferences(id)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to fetch updated preferences"})
+			return
+		}
+		c.JSON(200, prefs)
+	})
+
+	r.POST("/api/system/notifications/test-email", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionManageNotifications) {
+			return
+		}
+		masterEnabled, err := db.IsNotificationsMasterEnabled()
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to read notifications master setting"})
+			return
+		}
+		if !masterEnabled {
+			c.JSON(403, gin.H{"error": "Notifications are disabled by master toggle"})
+			return
+		}
+
+		var req struct {
+			db.NotificationSettings
+			TestEmail string `json:"test_email"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid request body"})
+			return
+		}
+
+		if req.SMTPPort <= 0 {
+			req.SMTPPort = 587
+		}
+		if req.SMTPPort < 1 || req.SMTPPort > 65535 {
+			c.JSON(400, gin.H{"error": "SMTP port must be between 1 and 65535"})
+			return
+		}
+
+		recipient := strings.TrimSpace(req.TestEmail)
+		if recipient == "" {
+			recipient = strings.TrimSpace(req.SMTPToEmail)
+		}
+		if recipient == "" {
+			recipient = strings.TrimSpace(req.SMTPFromEmail)
+		}
+		if recipient == "" {
+			username := strings.TrimSpace(req.SMTPUsername)
+			if strings.Contains(username, "@") {
+				recipient = username
+			}
+		}
+		if recipient == "" {
+			c.JSON(400, gin.H{"error": "Provide a test_email, smtp_to_email, smtp_from_email, or SMTP username with an email address"})
+			return
+		}
+
+		email := c.MustGet("email").(string)
+		subject := "Baseful SMTP test notification"
+		body := fmt.Sprintf("This is a test email from Baseful.\n\nTriggered by: %s\nTime: %s", email, time.Now().Format(time.RFC3339))
+		if err := system.SendSMTPEmail(req.NotificationSettings, recipient, subject, body); err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+
+		c.JSON(200, gin.H{"message": fmt.Sprintf("Test email sent to %s", recipient)})
+	})
+
+	r.POST("/api/system/notifications/test-discord", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionManageNotifications) {
+			return
+		}
+		masterEnabled, err := db.IsNotificationsMasterEnabled()
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to read notifications master setting"})
+			return
+		}
+		if !masterEnabled {
+			c.JSON(403, gin.H{"error": "Notifications are disabled by master toggle"})
+			return
+		}
+
+		var req db.NotificationSettings
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid request body"})
+			return
+		}
+
+		email := c.MustGet("email").(string)
+		message := fmt.Sprintf("Baseful Discord webhook test notification.\nTriggered by: %s\nTime: %s", email, time.Now().Format(time.RFC3339))
+		if err := system.SendDiscordWebhook(req.DiscordWebhookURL, message); err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+
+		c.JSON(200, gin.H{"message": "Discord webhook test sent"})
+	})
+
 	r.POST("/api/system/update-check", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
 		system.CheckForUpdates()
 		c.JSON(200, system.GetUpdateStatus())
 	})
 
 	r.POST("/api/system/update", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
 		if err := system.RunUpdate(); err != nil {
 			c.JSON(500, gin.H{"error": err.Error()})
 			return
@@ -734,6 +1379,9 @@ func main() {
 		id, err := strconv.Atoi(idStr)
 		if err != nil {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, id) {
 			return
 		}
 		list, err := backups.ListBackups(id)
@@ -755,6 +1403,9 @@ func main() {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
 			return
 		}
+		if !requireDatabaseAccess(c, id) {
+			return
+		}
 		settings, err := backups.GetBackupSettings(id)
 		if err != nil {
 			c.JSON(500, gin.H{"error": err.Error()})
@@ -768,6 +1419,9 @@ func main() {
 		id, err := strconv.Atoi(idStr)
 		if err != nil {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, id) {
 			return
 		}
 		var settings backups.BackupSettings
@@ -790,12 +1444,31 @@ func main() {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
 			return
 		}
+		if !requireDatabaseAccess(c, id) {
+			return
+		}
 		go func() {
 			fmt.Printf("Starting manual backup for DB %d...\n", id)
 			if err := backups.PerformBackup(id); err != nil {
 				fmt.Printf("Backup failed for DB %d: %v\n", id, err)
+				system.NotifyDatabaseEventAsync(
+					id,
+					db.NotificationEventBackupFailed,
+					"Baseful backup failed",
+					fmt.Sprintf("Database ID %d backup failed at %s.\nError: %v", id, time.Now().Format(time.RFC3339), err),
+					0,
+					"",
+				)
 			} else {
 				fmt.Printf("Backup completed for DB %d\n", id)
+				system.NotifyDatabaseEventAsync(
+					id,
+					db.NotificationEventBackupCompleted,
+					"Baseful backup completed",
+					fmt.Sprintf("Database ID %d backup completed at %s.", id, time.Now().Format(time.RFC3339)),
+					0,
+					"",
+				)
 			}
 		}()
 		c.JSON(200, gin.H{"message": "Backup started"})
@@ -808,6 +1481,9 @@ func main() {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
 			return
 		}
+		if !requireDatabaseAccess(c, id) {
+			return
+		}
 		backupIdStr := c.Param("backupId")
 		backupId, err := strconv.Atoi(backupIdStr)
 		if err != nil {
@@ -815,12 +1491,36 @@ func main() {
 			return
 		}
 
+		system.NotifyDatabaseEventAsync(
+			id,
+			db.NotificationEventRestoreStarted,
+			"Baseful restore started",
+			fmt.Sprintf("Restore started for database ID %d from backup ID %d at %s.", id, backupId, time.Now().Format(time.RFC3339)),
+			0,
+			"",
+		)
 		go func() {
 			fmt.Printf("Starting restore for DB %d from backup %d...\n", id, backupId)
 			if err := backups.RestoreBackup(id, backupId); err != nil {
 				fmt.Printf("Restore failed for DB %d: %v\n", id, backupId)
+				system.NotifyDatabaseEventAsync(
+					id,
+					db.NotificationEventRestoreFailed,
+					"Baseful restore failed",
+					fmt.Sprintf("Restore failed for database ID %d from backup ID %d at %s.\nError: %v", id, backupId, time.Now().Format(time.RFC3339), err),
+					0,
+					"",
+				)
 			} else {
 				fmt.Printf("Restore completed for DB %d\n", id)
+				system.NotifyDatabaseEventAsync(
+					id,
+					db.NotificationEventRestoreCompleted,
+					"Baseful restore completed",
+					fmt.Sprintf("Restore completed for database ID %d from backup ID %d at %s.", id, backupId, time.Now().Format(time.RFC3339)),
+					0,
+					"",
+				)
 			}
 		}()
 		c.JSON(200, gin.H{"message": "Restore started"})
@@ -831,6 +1531,9 @@ func main() {
 		id, err := strconv.Atoi(idStr)
 		if err != nil {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, id) {
 			return
 		}
 		backupIdStr := c.Param("backupId")
@@ -868,6 +1571,9 @@ func main() {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
 			return
 		}
+		if !requireDatabaseAccess(c, id) {
+			return
+		}
 		backupIdStr := c.Param("backupId")
 		backupId, err := strconv.Atoi(backupIdStr)
 		if err != nil {
@@ -896,12 +1602,36 @@ func main() {
 		}
 		_ = reader.Close()
 
+		system.NotifyDatabaseEventAsync(
+			id,
+			db.NotificationEventRestoreStarted,
+			"Baseful restore started",
+			fmt.Sprintf("Encrypted restore started for database ID %d from backup ID %d at %s.", id, backupId, time.Now().Format(time.RFC3339)),
+			0,
+			"",
+		)
 		go func() {
 			fmt.Printf("Starting encrypted restore for DB %d from backup %d...\n", id, backupId)
 			if err := backups.RestoreBackupWithPrivateKey(id, backupId, req.PrivateKey, req.Passphrase); err != nil {
 				fmt.Printf("Encrypted restore failed for DB %d backup %d: %v\n", id, backupId, err)
+				system.NotifyDatabaseEventAsync(
+					id,
+					db.NotificationEventRestoreFailed,
+					"Baseful restore failed",
+					fmt.Sprintf("Encrypted restore failed for database ID %d from backup ID %d at %s.\nError: %v", id, backupId, time.Now().Format(time.RFC3339), err),
+					0,
+					"",
+				)
 			} else {
 				fmt.Printf("Encrypted restore completed for DB %d backup %d\n", id, backupId)
+				system.NotifyDatabaseEventAsync(
+					id,
+					db.NotificationEventRestoreCompleted,
+					"Baseful restore completed",
+					fmt.Sprintf("Encrypted restore completed for database ID %d from backup ID %d at %s.", id, backupId, time.Now().Format(time.RFC3339)),
+					0,
+					"",
+				)
 			}
 		}()
 		c.JSON(200, gin.H{"message": "Restore started"})
@@ -915,6 +1645,9 @@ func main() {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
 			return
 		}
+		if !requireDatabaseAccess(c, id) {
+			return
+		}
 
 		file, header, err := c.Request.FormFile("file")
 		if err != nil {
@@ -924,12 +1657,36 @@ func main() {
 		defer file.Close()
 
 		fmt.Printf("Starting restore for DB %d from uploaded file: %s\n", id, header.Filename)
+		system.NotifyDatabaseEventAsync(
+			id,
+			db.NotificationEventRestoreStarted,
+			"Baseful restore started",
+			fmt.Sprintf("Restore from uploaded file started for database ID %d at %s. File: %s", id, time.Now().Format(time.RFC3339), header.Filename),
+			0,
+			"",
+		)
 
 		go func() {
 			if err := backups.RestoreFromFile(id, file); err != nil {
 				fmt.Printf("Restore from file failed for DB %d: %v\n", id, err)
+				system.NotifyDatabaseEventAsync(
+					id,
+					db.NotificationEventRestoreFailed,
+					"Baseful restore failed",
+					fmt.Sprintf("Restore from uploaded file failed for database ID %d at %s.\nError: %v", id, time.Now().Format(time.RFC3339), err),
+					0,
+					"",
+				)
 			} else {
 				fmt.Printf("Restore from file completed for DB %d\n", id)
+				system.NotifyDatabaseEventAsync(
+					id,
+					db.NotificationEventRestoreCompleted,
+					"Baseful restore completed",
+					fmt.Sprintf("Restore from uploaded file completed for database ID %d at %s.", id, time.Now().Format(time.RFC3339)),
+					0,
+					"",
+				)
 			}
 		}()
 		c.JSON(200, gin.H{"message": "Restore started"})
@@ -941,6 +1698,9 @@ func main() {
 		id, err := strconv.Atoi(idStr)
 		if err != nil {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, id) {
 			return
 		}
 
@@ -958,12 +1718,36 @@ func main() {
 		}
 
 		fmt.Printf("Starting restore for DB %d from external connection\n", id)
+		system.NotifyDatabaseEventAsync(
+			id,
+			db.NotificationEventRestoreStarted,
+			"Baseful restore started",
+			fmt.Sprintf("Restore from external connection started for database ID %d at %s.", id, time.Now().Format(time.RFC3339)),
+			0,
+			"",
+		)
 
 		go func() {
 			if err := backups.RestoreFromConnection(id, req.ConnectionString); err != nil {
 				fmt.Printf("Restore from connection failed for DB %d: %v\n", id, err)
+				system.NotifyDatabaseEventAsync(
+					id,
+					db.NotificationEventRestoreFailed,
+					"Baseful restore failed",
+					fmt.Sprintf("Restore from external connection failed for database ID %d at %s.\nError: %v", id, time.Now().Format(time.RFC3339), err),
+					0,
+					"",
+				)
 			} else {
 				fmt.Printf("Restore from connection completed for DB %d\n", id)
+				system.NotifyDatabaseEventAsync(
+					id,
+					db.NotificationEventRestoreCompleted,
+					"Baseful restore completed",
+					fmt.Sprintf("Restore from external connection completed for database ID %d at %s.", id, time.Now().Format(time.RFC3339)),
+					0,
+					"",
+				)
 			}
 		}()
 		c.JSON(200, gin.H{"message": "Restore started"})
@@ -973,7 +1757,23 @@ func main() {
 
 	// Get all projects
 	r.GET("/api/projects", func(c *gin.Context) {
-		rows, err := db.DB.Query("SELECT id, name, description, created_at FROM projects ORDER BY created_at DESC")
+		isAdmin := c.MustGet("is_admin").(bool)
+		userID := c.MustGet("user_id").(int)
+
+		query := "SELECT id, name, description, created_at FROM projects ORDER BY created_at DESC"
+		args := []interface{}{}
+		if !isAdmin {
+			query = `
+				SELECT p.id, p.name, p.description, p.created_at
+				FROM projects p
+				INNER JOIN user_project_access upa ON upa.project_id = p.id
+				WHERE upa.user_id = ?
+				ORDER BY p.created_at DESC
+			`
+			args = append(args, userID)
+		}
+
+		rows, err := db.DB.Query(query, args...)
 		if err != nil {
 			c.JSON(500, gin.H{"error": "Failed to query projects: " + err.Error()})
 			return
@@ -994,7 +1794,25 @@ func main() {
 				"name":        name,
 				"description": description,
 				"created_at":  createdAt,
+				"users":       []interface{}{}, // Default empty list
 			})
+		}
+
+		// Now fetch users for each project that was returned
+		for i, p := range projects {
+			projectID := p["id"].(int)
+			users, err := db.GetProjectUsers(projectID)
+			if err == nil {
+				userList := []map[string]interface{}{}
+				for _, u := range users {
+					userList = append(userList, map[string]interface{}{
+						"id":        u.ID,
+						"email":     u.Email,
+						"avatarUrl": u.AvatarURL,
+					})
+				}
+				projects[i]["users"] = userList
+			}
 		}
 
 		c.JSON(http.StatusOK, projects)
@@ -1002,6 +1820,12 @@ func main() {
 
 	// Create project
 	r.POST("/api/projects", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionCreateProjects) {
+			return
+		}
+		userID := c.MustGet("user_id").(int)
+		isAdmin := c.MustGet("is_admin").(bool)
+
 		var req struct {
 			Name        string `json:"name"`
 			Description string `json:"description"`
@@ -1026,6 +1850,17 @@ func main() {
 		}
 
 		id, _ := result.LastInsertId()
+
+		if !isAdmin {
+			if _, err := db.DB.Exec(
+				"INSERT OR IGNORE INTO user_project_access (user_id, project_id, created_by) VALUES (?, ?, ?)",
+				userID, id, userID,
+			); err != nil {
+				c.JSON(500, gin.H{"error": "Failed to grant creator access to project"})
+				return
+			}
+		}
+
 		c.JSON(201, gin.H{
 			"id":          id,
 			"name":        req.Name,
@@ -1036,13 +1871,21 @@ func main() {
 	// Get single project by ID
 	r.GET("/api/projects/:id", func(c *gin.Context) {
 		id := c.Param("id")
-		var projectID int
+		projectID, err := strconv.Atoi(id)
+		if err != nil || projectID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid project ID"})
+			return
+		}
+		if !requireProjectAccess(c, projectID) {
+			return
+		}
+		var dbProjectID int
 		var name, description, createdAt string
 
-		err := db.DB.QueryRow(
+		err = db.DB.QueryRow(
 			"SELECT id, name, description, created_at FROM projects WHERE id = ?",
 			id,
-		).Scan(&projectID, &name, &description, &createdAt)
+		).Scan(&dbProjectID, &name, &description, &createdAt)
 
 		if err != nil {
 			c.JSON(404, gin.H{"error": "Project not found"})
@@ -1050,7 +1893,7 @@ func main() {
 		}
 
 		c.JSON(200, gin.H{
-			"id":          projectID,
+			"id":          dbProjectID,
 			"name":        name,
 			"description": description,
 			"created_at":  createdAt,
@@ -1060,6 +1903,17 @@ func main() {
 	// Update project
 	r.PUT("/api/projects/:id", func(c *gin.Context) {
 		id := c.Param("id")
+		projectID, err := strconv.Atoi(id)
+		if err != nil || projectID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid project ID"})
+			return
+		}
+		if !requireProjectAccess(c, projectID) {
+			return
+		}
+		if !requirePermission(c, db.PermissionEditProjects) {
+			return
+		}
 
 		var req struct {
 			Name string `json:"name"`
@@ -1094,9 +1948,69 @@ func main() {
 		})
 	})
 
+	// Get users with access to a project
+	r.GET("/api/projects/:id/users", func(c *gin.Context) {
+		id := c.Param("id")
+		projectID, err := strconv.Atoi(id)
+		if err != nil || projectID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid project ID"})
+			return
+		}
+		if !requireProjectAccess(c, projectID) {
+			return
+		}
+
+		users, err := db.GetProjectUsers(projectID)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to fetch project users: " + err.Error()})
+			return
+		}
+		c.JSON(200, users)
+	})
+
+	// Set users with access to a project
+	r.PUT("/api/projects/:id/users", func(c *gin.Context) {
+		id := c.Param("id")
+		projectID, err := strconv.Atoi(id)
+		if err != nil || projectID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid project ID"})
+			return
+		}
+
+		// Only admins or users with edit_projects permission can manage users
+		if !requirePermission(c, db.PermissionEditProjects) {
+			return
+		}
+
+		var req struct {
+			UserIDs []int `json:"userIds"`
+		}
+		if err := c.BindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid request body"})
+			return
+		}
+
+		creatorID := c.MustGet("user_id").(int)
+
+		if err := db.SetProjectUsers(projectID, req.UserIDs, creatorID); err != nil {
+			c.JSON(500, gin.H{"error": "Failed to update project users: " + err.Error()})
+			return
+		}
+
+		c.JSON(200, gin.H{"message": "Project users updated"})
+	})
+
 	// Get databases for a project
 	r.GET("/api/projects/:id/databases", func(c *gin.Context) {
 		id := c.Param("id")
+		projectID, err := strconv.Atoi(id)
+		if err != nil || projectID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid project ID"})
+			return
+		}
+		if !requireProjectAccess(c, projectID) {
+			return
+		}
 		rows, err := db.DB.Query("SELECT id, name, type, host, port, status FROM databases WHERE project_id = ?", id)
 		if err != nil {
 			c.JSON(500, gin.H{"error": "Failed to query databases: " + err.Error()})
@@ -1130,7 +2044,22 @@ func main() {
 
 	// Get all databases
 	r.GET("/api/databases", func(c *gin.Context) {
-		rows, err := db.DB.Query("SELECT id, name, type, host, port, status, project_id FROM databases")
+		isAdmin := c.MustGet("is_admin").(bool)
+		userID := c.MustGet("user_id").(int)
+
+		query := "SELECT id, name, type, host, port, status, project_id FROM databases"
+		args := []interface{}{}
+		if !isAdmin {
+			query = `
+				SELECT d.id, d.name, d.type, d.host, d.port, d.status, d.project_id
+				FROM databases d
+				INNER JOIN user_project_access upa ON upa.project_id = d.project_id
+				WHERE upa.user_id = ?
+			`
+			args = append(args, userID)
+		}
+
+		rows, err := db.DB.Query(query, args...)
 		if err != nil {
 			c.JSON(500, gin.H{"error": "Failed to query databases: " + err.Error()})
 			return
@@ -1162,6 +2091,12 @@ func main() {
 
 	// Create database (Streaming for progress)
 	r.POST("/api/databases", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionCreateDatabases) {
+			return
+		}
+		userID := c.MustGet("user_id").(int)
+		isAdmin := c.MustGet("is_admin").(bool)
+
 		var req struct {
 			Name         string  `json:"name"`
 			Type         string  `json:"type"`
@@ -1199,6 +2134,18 @@ func main() {
 			if err != nil || count == 0 {
 				c.JSON(400, gin.H{"error": "Invalid project ID"})
 				return
+			}
+
+			if !isAdmin {
+				allowed, err := db.UserCanAccessProject(userID, req.ProjectID)
+				if err != nil {
+					c.JSON(500, gin.H{"error": "Failed to validate project access"})
+					return
+				}
+				if !allowed {
+					c.JSON(403, gin.H{"error": "Access denied for this project"})
+					return
+				}
 			}
 		}
 
@@ -1377,10 +2324,19 @@ func main() {
 	// Get single database by ID
 	r.GET("/api/databases/:id", func(c *gin.Context) {
 		id := c.Param("id")
+		databaseID, err := strconv.Atoi(id)
+		if err != nil || databaseID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, databaseID) {
+			return
+		}
+
 		var db_id, port, projectID int
 		var name, dbType, host, status, version, password, containerID string
 
-		err := db.DB.QueryRow(
+		err = db.DB.QueryRow(
 			"SELECT id, name, type, host, port, status, version, password, project_id, container_id FROM databases WHERE id = ?",
 			id,
 		).Scan(&db_id, &name, &dbType, &host, &port, &status, &version, &password, &projectID, &containerID)
@@ -1429,9 +2385,17 @@ func main() {
 	r.POST("/api/databases/:id/:action", func(c *gin.Context) {
 		id := c.Param("id")
 		action := c.Param("action")
+		databaseID, err := strconv.Atoi(id)
+		if err != nil || databaseID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, databaseID) {
+			return
+		}
 
 		var containerID, status string
-		err := db.DB.QueryRow("SELECT container_id, status FROM databases WHERE id = ?", id).Scan(&containerID, &status)
+		err = db.DB.QueryRow("SELECT container_id, status FROM databases WHERE id = ?", id).Scan(&containerID, &status)
 		if err != nil {
 			c.JSON(404, gin.H{"error": "Database not found"})
 			return
@@ -1518,10 +2482,18 @@ func main() {
 	// Get all branches for a database
 	r.GET("/api/databases/:id/branches", func(c *gin.Context) {
 		id := c.Param("id")
+		databaseID, err := strconv.Atoi(id)
+		if err != nil || databaseID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, databaseID) {
+			return
+		}
 
 		// Verify database exists
 		var dbName string
-		err := db.DB.QueryRow("SELECT name FROM databases WHERE id = ?", id).Scan(&dbName)
+		err = db.DB.QueryRow("SELECT name FROM databases WHERE id = ?", id).Scan(&dbName)
 		if err != nil {
 			c.JSON(404, gin.H{"error": "Database not found"})
 			return
@@ -1562,6 +2534,14 @@ func main() {
 	// Create a new branch
 	r.POST("/api/databases/:id/branches", func(c *gin.Context) {
 		id := c.Param("id")
+		databaseID, err := strconv.Atoi(id)
+		if err != nil || databaseID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, databaseID) {
+			return
+		}
 
 		var req struct {
 			Name string `json:"name"`
@@ -1579,7 +2559,7 @@ func main() {
 		// Verify database exists and get details
 		var dbID, dbPort int
 		var dbName, dbType, dbHost, dbPassword, dbVersion, dbContainerID string
-		err := db.DB.QueryRow(
+		err = db.DB.QueryRow(
 			"SELECT id, name, type, host, port, password, version, container_id FROM databases WHERE id = ?",
 			id,
 		).Scan(&dbID, &dbName, &dbType, &dbHost, &dbPort, &dbPassword, &dbVersion, &dbContainerID)
@@ -1741,9 +2721,17 @@ func main() {
 		id := c.Param("id")
 		branchID := c.Param("branchId")
 		action := c.Param("action")
+		databaseID, err := strconv.Atoi(id)
+		if err != nil || databaseID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, databaseID) {
+			return
+		}
 
 		var containerID, status string
-		err := db.DB.QueryRow("SELECT container_id, status FROM branches WHERE id = ? AND database_id = ?", branchID, id).Scan(&containerID, &status)
+		err = db.DB.QueryRow("SELECT container_id, status FROM branches WHERE id = ? AND database_id = ?", branchID, id).Scan(&containerID, &status)
 		if err != nil {
 			c.JSON(404, gin.H{"error": "Branch not found"})
 			return
@@ -1800,6 +2788,14 @@ func main() {
 	r.POST("/api/databases/:id/sql-assistant", func(c *gin.Context) {
 		id := c.Param("id")
 		userID := c.MustGet("user_id").(int)
+		databaseID, err := strconv.Atoi(id)
+		if err != nil || databaseID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, databaseID) {
+			return
+		}
 
 		apiKey, err := db.GetUserOpenRouterAPIKey(userID)
 		if err != nil {
@@ -1890,10 +2886,18 @@ func main() {
 	// SQL Query Endpoint
 	r.POST("/api/databases/:id/query", func(c *gin.Context) {
 		id := c.Param("id")
+		databaseID, err := strconv.Atoi(id)
+		if err != nil || databaseID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, databaseID) {
+			return
+		}
 
 		var db_id, port int
 		var name, dbType, host, status, version, password string
-		err := db.DB.QueryRow(
+		err = db.DB.QueryRow(
 			"SELECT id, name, type, host, port, status, version, password FROM databases WHERE id = ?",
 			id,
 		).Scan(&db_id, &name, &dbType, &host, &port, &status, &version, &password)
@@ -1982,10 +2986,18 @@ func main() {
 	// List Tables Endpoint
 	r.GET("/api/databases/:id/tables", func(c *gin.Context) {
 		id := c.Param("id")
+		databaseID, err := strconv.Atoi(id)
+		if err != nil || databaseID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, databaseID) {
+			return
+		}
 
 		var db_id, port int
 		var name, dbType, host, status, version, password string
-		err := db.DB.QueryRow(
+		err = db.DB.QueryRow(
 			"SELECT id, name, type, host, port, status, version, password FROM databases WHERE id = ?",
 			id,
 		).Scan(&db_id, &name, &dbType, &host, &port, &status, &version, &password)
@@ -2073,10 +3085,18 @@ func main() {
 	r.GET("/api/databases/:id/tables/:tableName", func(c *gin.Context) {
 		id := c.Param("id")
 		tableName := c.Param("tableName")
+		databaseID, err := strconv.Atoi(id)
+		if err != nil || databaseID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, databaseID) {
+			return
+		}
 
 		var db_id, port int
 		var name, dbType, host, status, version, password string
-		err := db.DB.QueryRow(
+		err = db.DB.QueryRow(
 			"SELECT id, name, type, host, port, status, version, password FROM databases WHERE id = ?",
 			id,
 		).Scan(&db_id, &name, &dbType, &host, &port, &status, &version, &password)
@@ -2311,10 +3331,18 @@ func main() {
 	r.PUT("/api/databases/:id/tables/:tableName/rows", func(c *gin.Context) {
 		id := c.Param("id")
 		tableName := c.Param("tableName")
+		databaseID, err := strconv.Atoi(id)
+		if err != nil || databaseID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, databaseID) {
+			return
+		}
 
 		var db_id, port int
 		var name, dbType, host, status, version, password string
-		err := db.DB.QueryRow(
+		err = db.DB.QueryRow(
 			"SELECT id, name, type, host, port, status, version, password FROM databases WHERE id = ?",
 			id,
 		).Scan(&db_id, &name, &dbType, &host, &port, &status, &version, &password)
@@ -2405,6 +3433,9 @@ func main() {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
 			return
 		}
+		if !requireDatabaseAccess(c, databaseID) {
+			return
+		}
 
 		tokens, err := db.GetTokensForDatabase(databaseID)
 		if err != nil {
@@ -2421,6 +3452,9 @@ func main() {
 		databaseID, err := strconv.Atoi(id)
 		if err != nil {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, databaseID) {
 			return
 		}
 
@@ -2483,6 +3517,14 @@ func main() {
 
 	// Revoke a specific token
 	r.DELETE("/api/databases/:id/tokens/:token_id", func(c *gin.Context) {
+		databaseID, err := strconv.Atoi(c.Param("id"))
+		if err != nil || databaseID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, databaseID) {
+			return
+		}
 		tokenID := c.Param("token_id")
 
 		if err := db.RevokeToken(tokenID); err != nil {
@@ -2499,6 +3541,9 @@ func main() {
 		dbID, err := strconv.Atoi(id)
 		if err != nil {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, dbID) {
 			return
 		}
 
@@ -2581,6 +3626,9 @@ func main() {
 		dbID, err := strconv.Atoi(id)
 		if err != nil {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, dbID) {
 			return
 		}
 
@@ -2779,8 +3827,16 @@ func main() {
 	// Get detailed database connections
 	r.GET("/api/databases/:id/connections", func(c *gin.Context) {
 		id := c.Param("id")
+		databaseID, err := strconv.Atoi(id)
+		if err != nil || databaseID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, databaseID) {
+			return
+		}
 		var containerID, status string
-		err := db.DB.QueryRow("SELECT container_id, status FROM databases WHERE id = ?", id).Scan(&containerID, &status)
+		err = db.DB.QueryRow("SELECT container_id, status FROM databases WHERE id = ?", id).Scan(&containerID, &status)
 		if err != nil {
 			c.JSON(404, gin.H{"error": "Database not found"})
 			return
@@ -2865,6 +3921,9 @@ func main() {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
 			return
 		}
+		if !requireDatabaseAccess(c, dbID) {
+			return
+		}
 
 		history, err := metrics.GetHistory(dbID)
 		if err != nil {
@@ -2879,9 +3938,17 @@ func main() {
 	r.POST("/api/databases/:id/connections/:pid/terminate", func(c *gin.Context) {
 		id := c.Param("id")
 		pid := c.Param("pid")
+		databaseID, err := strconv.Atoi(id)
+		if err != nil || databaseID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, databaseID) {
+			return
+		}
 
 		var containerID, status string
-		err := db.DB.QueryRow("SELECT container_id, status FROM databases WHERE id = ?", id).Scan(&containerID, &status)
+		err = db.DB.QueryRow("SELECT container_id, status FROM databases WHERE id = ?", id).Scan(&containerID, &status)
 		if err != nil {
 			c.JSON(404, gin.H{"error": "Database not found"})
 			return
@@ -2937,11 +4004,19 @@ func main() {
 	// Get resource limits for a database
 	r.GET("/api/databases/:id/limits", func(c *gin.Context) {
 		id := c.Param("id")
+		databaseID, err := strconv.Atoi(id)
+		if err != nil || databaseID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, databaseID) {
+			return
+		}
 
 		var maxCPU float64
 		var maxRAMMB, maxStorageMB int
 
-		err := db.DB.QueryRow(
+		err = db.DB.QueryRow(
 			"SELECT max_cpu, max_ram_mb, max_storage_mb FROM databases WHERE id = ?",
 			id,
 		).Scan(&maxCPU, &maxRAMMB, &maxStorageMB)
@@ -2961,8 +4036,12 @@ func main() {
 	// Update resource limits for a database
 	r.PUT("/api/databases/:id/limits", func(c *gin.Context) {
 		id := c.Param("id")
-		if _, err := strconv.Atoi(id); err != nil {
+		databaseID, err := strconv.Atoi(id)
+		if err != nil || databaseID <= 0 {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, databaseID) {
 			return
 		}
 
@@ -2991,7 +4070,7 @@ func main() {
 		}
 
 		// Update database record
-		_, err := db.DB.Exec(
+		_, err = db.DB.Exec(
 			"UPDATE databases SET max_cpu = ?, max_ram_mb = ?, max_storage_mb = ? WHERE id = ?",
 			req.MaxCPU, req.MaxRAMMB, req.MaxStorageMB, id,
 		)
@@ -3042,17 +4121,83 @@ func main() {
 
 	// List all containers
 	r.GET("/api/docker/containers", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
 		containers, err := docker.ListContainers()
 		if err != nil {
 			c.JSON(500, gin.H{"error": "Failed to list containers: " + err.Error()})
 			return
 		}
+
+		// Filter containers by project access for non-admins
+		isAdmin := c.MustGet("is_admin").(bool)
+		if !isAdmin {
+			userID := c.MustGet("user_id").(int)
+			accessibleProjectIDs, err := db.GetUserProjectAccess(userID)
+			if err != nil {
+				c.JSON(500, gin.H{"error": "Failed to get project access"})
+				return
+			}
+			// Build a set of accessible project IDs as strings
+			allowedIDs := make(map[string]bool)
+			for _, id := range accessibleProjectIDs {
+				allowedIDs[strconv.Itoa(id)] = true
+			}
+			// Filter the containers slice
+			var filtered []docker.ContainerInfo
+			for _, ctr := range containers {
+				projectID := ctr.Labels["baseful.project_id"]
+				if allowedIDs[projectID] {
+					filtered = append(filtered, ctr)
+				}
+			}
+			if filtered == nil {
+				filtered = []docker.ContainerInfo{}
+			}
+			c.JSON(200, filtered)
+			return
+		}
+
 		c.JSON(200, containers)
 	})
 
 	// Execute command in container
 	r.POST("/api/docker/containers/:id/exec", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
 		id := c.Param("id")
+
+		// For non-admins, verify they have access to the container's project
+		isAdmin := c.MustGet("is_admin").(bool)
+		if !isAdmin {
+			// Look up the container's project label
+			containers, err := docker.ListContainers()
+			if err != nil {
+				c.JSON(500, gin.H{"error": "Failed to inspect container"})
+				return
+			}
+			var projectID string
+			for _, ctr := range containers {
+				if ctr.ID == id {
+					projectID = ctr.Labels["baseful.project_id"]
+					break
+				}
+			}
+			if projectID == "" {
+				c.JSON(403, gin.H{"error": "Access denied: container has no associated project"})
+				return
+			}
+			pid, _ := strconv.Atoi(projectID)
+			userID := c.MustGet("user_id").(int)
+			canAccess, err := db.UserCanAccessProject(userID, pid)
+			if err != nil || !canAccess {
+				c.JSON(403, gin.H{"error": "Access denied: insufficient project permissions"})
+				return
+			}
+		}
+
 		var req struct {
 			Command string `json:"command"`
 			Cwd     string `json:"cwd"`
@@ -3080,6 +4225,9 @@ func main() {
 
 	// Get Docker network status
 	r.GET("/api/docker/network", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
 		exists, err := docker.NetworkExists()
 		if err != nil {
 			c.JSON(500, gin.H{"error": "Failed to check network"})
@@ -3111,6 +4259,9 @@ func main() {
 
 	// Get Proxy status
 	r.GET("/api/docker/proxy", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
 		c.JSON(200, gin.H{
 			"running": true,
 			"port":    auth.GetProxyPort(),
@@ -3120,6 +4271,9 @@ func main() {
 
 	// Restart Proxy (not applicable for in-memory proxy)
 	r.POST("/api/docker/proxy/restart", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
 		c.JSON(200, gin.H{
 			"message": "Proxy is running in-memory and cannot be restarted. Restart the main application instead.",
 		})

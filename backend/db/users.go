@@ -17,6 +17,31 @@ type User struct {
 	CreatedAt    string `json:"createdAt"`
 }
 
+type UserSummary struct {
+	ID        int    `json:"id"`
+	Email     string `json:"email"`
+	FirstName string `json:"firstName"`
+	LastName  string `json:"lastName"`
+	IsAdmin   bool   `json:"isAdmin"`
+	AvatarURL string `json:"avatarUrl"`
+}
+
+const (
+	PermissionServerAccess        = "server_access"
+	PermissionManageNotifications = "manage_notifications"
+	PermissionCreateProjects      = "create_projects"
+	PermissionEditProjects        = "edit_projects"
+	PermissionCreateDatabases     = "create_databases"
+)
+
+var AvailablePermissionKeys = []string{
+	PermissionServerAccess,
+	PermissionManageNotifications,
+	PermissionCreateProjects,
+	PermissionEditProjects,
+	PermissionCreateDatabases,
+}
+
 // CreateUser creates a new user in the database
 func CreateUser(email, password, firstName, lastName string, isAdmin bool) (int, error) {
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
@@ -52,6 +77,46 @@ func GetUserByEmail(email string) (*User, error) {
 	}
 
 	return &user, nil
+}
+
+// GetUserByID retrieves a user by their ID
+func GetUserByID(id int) (*User, error) {
+	var user User
+	err := DB.QueryRow(
+		"SELECT id, email, password_hash, COALESCE(first_name, ''), COALESCE(last_name, ''), is_admin, COALESCE(avatar_url, ''), created_at FROM users WHERE id = ?",
+		id,
+	).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.FirstName, &user.LastName, &user.IsAdmin, &user.AvatarURL, &user.CreatedAt)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &user, nil
+}
+
+// GetAllUsers returns all users without sensitive fields
+func GetAllUsers() ([]UserSummary, error) {
+	rows, err := DB.Query(
+		"SELECT id, email, COALESCE(first_name, ''), COALESCE(last_name, ''), is_admin FROM users ORDER BY created_at DESC",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	users := []UserSummary{}
+	for rows.Next() {
+		var user UserSummary
+		if err := rows.Scan(&user.ID, &user.Email, &user.FirstName, &user.LastName, &user.IsAdmin); err != nil {
+			return nil, err
+		}
+		users = append(users, user)
+	}
+
+	return users, nil
 }
 
 // UpdateUser updates a user's information
@@ -160,4 +225,250 @@ func GetWhitelistedEmails() ([]string, error) {
 func RemoveEmailFromWhitelist(email string) error {
 	_, err := DB.Exec("DELETE FROM whitelisted_emails WHERE email = ?", email)
 	return err
+}
+
+// GetUserProjectAccess returns all project IDs a user can access
+func GetUserProjectAccess(userID int) ([]int, error) {
+	rows, err := DB.Query(
+		"SELECT project_id FROM user_project_access WHERE user_id = ? ORDER BY project_id ASC",
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	projectIDs := []int{}
+	for rows.Next() {
+		var projectID int
+		if err := rows.Scan(&projectID); err != nil {
+			return nil, err
+		}
+		projectIDs = append(projectIDs, projectID)
+	}
+	return projectIDs, nil
+}
+
+// SetUserProjectAccess replaces all project access rows for a user
+func SetUserProjectAccess(userID int, projectIDs []int) error {
+	tx, err := DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("DELETE FROM user_project_access WHERE user_id = ?", userID); err != nil {
+		return err
+	}
+
+	seen := make(map[int]bool)
+	for _, projectID := range projectIDs {
+		if projectID <= 0 || seen[projectID] {
+			continue
+		}
+		seen[projectID] = true
+		if _, err := tx.Exec(
+			"INSERT INTO user_project_access (user_id, project_id) VALUES (?, ?)",
+			userID,
+			projectID,
+		); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// GetProjectUsers returns all users who have access to a specific project.
+// This automatically includes all admins.
+func GetProjectUsers(projectID int) ([]UserSummary, error) {
+	rows, err := DB.Query(`
+		SELECT u.id, u.email, COALESCE(u.first_name, ''), COALESCE(u.last_name, ''), u.is_admin, COALESCE(u.avatar_url, '')
+		FROM users u
+		INNER JOIN user_project_access upa ON upa.user_id = u.id
+		WHERE upa.project_id = ?
+		UNION
+		SELECT u.id, u.email, COALESCE(u.first_name, ''), COALESCE(u.last_name, ''), u.is_admin, COALESCE(u.avatar_url, '')
+		FROM users u
+		WHERE u.is_admin = true
+		ORDER BY email ASC
+	`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	users := []UserSummary{}
+	for rows.Next() {
+		var user UserSummary
+		if err := rows.Scan(&user.ID, &user.Email, &user.FirstName, &user.LastName, &user.IsAdmin, &user.AvatarURL); err != nil {
+			return nil, err
+		}
+		users = append(users, user)
+	}
+	return users, nil
+}
+
+// SetProjectUsers replaces all user access rows for a project
+func SetProjectUsers(projectID int, userIDs []int, createdBy int) error {
+	tx, err := DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("DELETE FROM user_project_access WHERE project_id = ?", projectID); err != nil {
+		return err
+	}
+
+	seen := make(map[int]bool)
+	for _, userID := range userIDs {
+		if userID <= 0 || seen[userID] {
+			continue
+		}
+		seen[userID] = true
+		if _, err := tx.Exec(
+			"INSERT INTO user_project_access (user_id, project_id, created_by) VALUES (?, ?, ?)",
+			userID,
+			projectID,
+			createdBy,
+		); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// UserCanAccessProject checks if a user has access to a project
+func UserCanAccessProject(userID, projectID int) (bool, error) {
+	if projectID <= 0 {
+		return false, nil
+	}
+
+	var count int
+	err := DB.QueryRow(
+		"SELECT COUNT(*) FROM user_project_access WHERE user_id = ? AND project_id = ?",
+		userID,
+		projectID,
+	).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// UserCanAccessDatabase checks if a user can access a database via project access
+func UserCanAccessDatabase(userID, databaseID int) (bool, error) {
+	if databaseID <= 0 {
+		return false, nil
+	}
+
+	var count int
+	err := DB.QueryRow(`
+		SELECT COUNT(*)
+		FROM databases d
+		INNER JOIN user_project_access upa ON upa.project_id = d.project_id
+		WHERE d.id = ? AND upa.user_id = ?
+	`, databaseID, userID).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func IsValidPermissionKey(permission string) bool {
+	for _, key := range AvailablePermissionKeys {
+		if key == permission {
+			return true
+		}
+	}
+	return false
+}
+
+// GetUserPermissions returns permission keys for the given user.
+func GetUserPermissions(userID int) ([]string, error) {
+	rows, err := DB.Query(
+		"SELECT permission_key FROM user_permissions WHERE user_id = ? ORDER BY permission_key ASC",
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	permissions := []string{}
+	for rows.Next() {
+		var permission string
+		if err := rows.Scan(&permission); err != nil {
+			return nil, err
+		}
+		permissions = append(permissions, permission)
+	}
+	return permissions, nil
+}
+
+// SetUserPermissions replaces all explicit permissions for a user.
+func SetUserPermissions(userID int, permissions []string) error {
+	tx, err := DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("DELETE FROM user_permissions WHERE user_id = ?", userID); err != nil {
+		return err
+	}
+
+	seen := make(map[string]bool)
+	for _, permission := range permissions {
+		if seen[permission] {
+			continue
+		}
+		seen[permission] = true
+		if _, err := tx.Exec(
+			"INSERT INTO user_permissions (user_id, permission_key) VALUES (?, ?)",
+			userID,
+			permission,
+		); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// UserHasPermission checks if the user has a specific permission key.
+func UserHasPermission(userID int, permission string) (bool, error) {
+	var count int
+	err := DB.QueryRow(
+		"SELECT COUNT(*) FROM user_permissions WHERE user_id = ? AND permission_key = ?",
+		userID,
+		permission,
+	).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// DeleteUserByID removes a user and related access/permission mappings.
+func DeleteUserByID(userID int) error {
+	tx, err := DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("DELETE FROM user_project_access WHERE user_id = ?", userID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM user_permissions WHERE user_id = ?", userID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM users WHERE id = ?", userID); err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }

@@ -14,6 +14,8 @@ import {
   UsersIcon,
   XIcon,
   NotePencilIcon,
+  BellSimpleIcon,
+  SirenIcon,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { useAuth } from "@/context/AuthContext";
@@ -34,15 +36,21 @@ export default function Sidebar() {
   const { selectedDatabase, setSelectedDatabase, databases, refreshDatabases } =
     useDatabase();
   const { projects, refreshProjects, updateProjectName } = useProject();
-  const { user } = useAuth();
+  const { user, hasPermission } = useAuth();
   const location = useLocation();
   const [createMenuOpen, setCreateMenuOpen] = useState(false);
   const [selectorOpen, setSelectorOpen] = useState(false);
   const [editingProjectId, setEditingProjectId] = useState<number | null>(null);
   const [editingProjectName, setEditingProjectName] = useState("");
   const [isSavingProjectName, setIsSavingProjectName] = useState(false);
+  const canCreateProjects = hasPermission("create_projects");
+  const canCreateDatabases = hasPermission("create_databases");
+  const canEditProjects = hasPermission("edit_projects");
+  const canAccessServer = hasPermission("server_access");
+  const canManageNotifications = hasPermission("manage_notifications");
 
   const startProjectEdit = (projectId: number, currentName: string) => {
+    if (!canEditProjects) return;
     setEditingProjectId(projectId);
     setEditingProjectName(currentName);
   };
@@ -53,6 +61,7 @@ export default function Sidebar() {
   };
 
   const saveProjectEdit = async () => {
+    if (!canEditProjects) return;
     if (!editingProjectId || isSavingProjectName) return;
 
     const trimmedName = editingProjectName.trim();
@@ -220,7 +229,7 @@ export default function Sidebar() {
                                   parseInt(projectId) || undefined,
                                 )}
                               </p>
-                              {parseInt(projectId) > 0 && (
+                              {parseInt(projectId) > 0 && canEditProjects && (
                                 <button
                                   type="button"
                                   onClick={(e) => {
@@ -287,33 +296,37 @@ export default function Sidebar() {
           <Popover open={createMenuOpen} onOpenChange={setCreateMenuOpen}>
             <PopoverTrigger asChild>
               <div
-                className={`bg-card size-6 flex items-center justify-center rounded-sm  hover:text-neutral-300 transition-colors duration-200 cursor-pointer ${createMenuOpen ? "text-neutral-300 bg-neutral-800" : "text-neutral-400 bg-card"}`}
+                className={`bg-card size-6 flex items-center justify-center rounded-sm  hover:text-neutral-300 transition-colors duration-200 cursor-pointer ${createMenuOpen ? "text-neutral-300 bg-neutral-800" : "text-neutral-400 bg-card"} ${!canCreateProjects && !canCreateDatabases ? "opacity-50 pointer-events-none" : ""}`}
               >
                 <PlusIcon size={16} />
               </div>
             </PopoverTrigger>
             <PopoverContent className="w-fit p-2" align="end">
               <div className="flex flex-col gap-1">
-                <CreateProjectDialog
-                  onProjectCreated={() => {
-                    refreshProjects();
-                    setCreateMenuOpen(false);
-                  }}
-                >
-                  <button className="flex focus:ring-0 flex-row items-center gap-2 p-2 rounded-md hover:bg-accent transition-colors text-left w-full">
-                    <span className="text-sm">New Project</span>
-                  </button>
-                </CreateProjectDialog>
-                <CreateDatabaseDialog
-                  onDatabaseCreated={() => {
-                    refreshDatabases();
-                    setCreateMenuOpen(false);
-                  }}
-                >
-                  <button className="flex flex-row items-center gap-2 p-2 rounded-md hover:bg-accent transition-colors text-left w-full">
-                    <span className="text-sm">New Database</span>
-                  </button>
-                </CreateDatabaseDialog>
+                {canCreateProjects && (
+                  <CreateProjectDialog
+                    onProjectCreated={() => {
+                      refreshProjects();
+                      setCreateMenuOpen(false);
+                    }}
+                  >
+                    <button className="flex focus:ring-0 flex-row items-center gap-2 p-2 rounded-md hover:bg-accent transition-colors text-left w-full">
+                      <span className="text-sm">New Project</span>
+                    </button>
+                  </CreateProjectDialog>
+                )}
+                {canCreateDatabases && (
+                  <CreateDatabaseDialog
+                    onDatabaseCreated={() => {
+                      refreshDatabases();
+                      setCreateMenuOpen(false);
+                    }}
+                  >
+                    <button className="flex flex-row items-center gap-2 p-2 rounded-md hover:bg-accent transition-colors text-left w-full">
+                      <span className="text-sm">New Database</span>
+                    </button>
+                  </CreateDatabaseDialog>
+                )}
               </div>
             </PopoverContent>
           </Popover>
@@ -427,6 +440,35 @@ export default function Sidebar() {
                 </Link>
               </li>
 
+              {canManageNotifications && (
+                <li
+                  className={`py-1.5 px-2.5 rounded-md ${
+                    location.pathname ===
+                    (selectedDatabase
+                      ? `/db/${selectedDatabase.id}/notifications`
+                      : "/")
+                      ? "bg-muted/50"
+                      : ""
+                  }`}
+                >
+                  <Link
+                    to={
+                      selectedDatabase
+                        ? `/db/${selectedDatabase.id}/notifications`
+                        : "/"
+                    }
+                    className="text-neutral-100 text-sm flex flex-row items-center gap-2"
+                  >
+                    <SirenIcon
+                      size={18}
+                      weight="bold"
+                      className="text-neutral-400"
+                    />
+                    <span>Alerts</span>
+                  </Link>
+                </li>
+              )}
+
               <li
                 className={`py-1.5 px-2.5 rounded-md ${
                   location.pathname ===
@@ -457,12 +499,13 @@ export default function Sidebar() {
           </div>
         )}
 
+        {(canAccessServer || canManageNotifications) && (
         <div>
           <h2 className="text-xs font-medium text-neutral-400 mb-3 px-2.5">
             SERVER
           </h2>
           <ul className="flex flex-col gap-1">
-            <li
+            {canAccessServer && <li
               className={`py-1.5 px-2.5 rounded-md ${
                 location.pathname === "/monitoring" ? "bg-muted/50" : ""
               }`}
@@ -478,8 +521,8 @@ export default function Sidebar() {
                 />
                 <span>Monitoring</span>
               </Link>
-            </li>
-            <li
+            </li>}
+            {canAccessServer && <li
               className={`py-1.5 px-2.5 rounded-md ${
                 location.pathname === "/containers" ? "bg-muted/50" : ""
               }`}
@@ -495,8 +538,8 @@ export default function Sidebar() {
                 />
                 <span>Containers</span>
               </Link>
-            </li>
-            <li
+            </li>}
+            {canAccessServer && <li
               className={`py-1.5 px-2.5 rounded-md ${
                 location.pathname === "/web-server" ? "bg-muted/50" : ""
               }`}
@@ -508,8 +551,25 @@ export default function Sidebar() {
                 <Globe size={18} weight="bold" className="text-neutral-400" />
                 <span>Web Server</span>
               </Link>
-            </li>
-            <li
+            </li>}
+            {canManageNotifications && <li
+              className={`py-1.5 px-2.5 rounded-md ${
+                location.pathname === "/notifications" ? "bg-muted/50" : ""
+              }`}
+            >
+              <Link
+                to="/notifications"
+                className="text-neutral-100 text-sm flex flex-row items-center gap-2"
+              >
+                <BellSimpleIcon
+                  size={18}
+                  weight="bold"
+                  className="text-neutral-400"
+                />
+                <span>Notification Center</span>
+              </Link>
+            </li>}
+            {canAccessServer && <li
               className={`py-1.5 px-2.5 rounded-md ${
                 location.pathname === "/security" ? "bg-muted/50" : ""
               }`}
@@ -525,9 +585,10 @@ export default function Sidebar() {
                 />
                 <span>Security</span>
               </Link>
-            </li>
+            </li>}
           </ul>
         </div>
+        )}
 
         {user?.isAdmin && (
           <div>

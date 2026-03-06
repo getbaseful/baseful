@@ -129,9 +129,58 @@ func InitDB() error {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS user_project_access (
+        user_id INTEGER NOT NULL,
+        project_id INTEGER NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        created_by INTEGER,
+        PRIMARY KEY (user_id, project_id),
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (project_id) REFERENCES projects(id),
+        FOREIGN KEY (created_by) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS user_permissions (
+        user_id INTEGER NOT NULL,
+        permission_key TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (user_id, permission_key),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS notification_settings (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        smtp_host TEXT,
+        smtp_port INTEGER DEFAULT 587,
+        smtp_username TEXT,
+        smtp_password TEXT,
+        smtp_from_email TEXT,
+        smtp_from_name TEXT,
+        smtp_to_email TEXT,
+        discord_webhook_url TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS database_notification_preferences (
+        database_id INTEGER NOT NULL,
+        event_key TEXT NOT NULL,
+        enabled BOOLEAN NOT NULL DEFAULT 0,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (database_id, event_key),
+        FOREIGN KEY (database_id) REFERENCES databases(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS system_notification_preferences (
+        event_key TEXT PRIMARY KEY,
+        enabled BOOLEAN NOT NULL DEFAULT 0,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
     -- Insert default settings if they don't exist
     INSERT OR IGNORE INTO settings (key, value) VALUES ('metrics_enabled', 'true');
     INSERT OR IGNORE INTO settings (key, value) VALUES ('metrics_sample_rate', '5');
+    INSERT OR IGNORE INTO settings (key, value) VALUES ('notifications_master_enabled', 'false');
     `
 
 	_, err = DB.Exec(schema)
@@ -194,6 +243,8 @@ func InitDB() error {
 
 	// Migration: Add mapped_port for local dev access (running proxy on host)
 	DB.Exec("ALTER TABLE databases ADD COLUMN mapped_port INTEGER DEFAULT 0")
+	// Migration: Notification recipient address
+	DB.Exec("ALTER TABLE notification_settings ADD COLUMN smtp_to_email TEXT")
 
 	// Migration: Persist JWT issue timestamps so connection strings remain stable
 	DB.Exec("ALTER TABLE database_tokens ADD COLUMN issued_at DATETIME DEFAULT CURRENT_TIMESTAMP")
@@ -218,6 +269,64 @@ func InitDB() error {
         email TEXT PRIMARY KEY,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`)
+	DB.Exec(`CREATE TABLE IF NOT EXISTS user_project_access (
+        user_id INTEGER NOT NULL,
+        project_id INTEGER NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        created_by INTEGER,
+        PRIMARY KEY (user_id, project_id),
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (project_id) REFERENCES projects(id),
+        FOREIGN KEY (created_by) REFERENCES users(id)
+    )`)
+	DB.Exec(`CREATE TABLE IF NOT EXISTS user_permissions (
+        user_id INTEGER NOT NULL,
+        permission_key TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (user_id, permission_key),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    )`)
+	DB.Exec(`CREATE TABLE IF NOT EXISTS notification_settings (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        smtp_host TEXT,
+        smtp_port INTEGER DEFAULT 587,
+        smtp_username TEXT,
+        smtp_password TEXT,
+        smtp_from_email TEXT,
+        smtp_from_name TEXT,
+        smtp_to_email TEXT,
+        discord_webhook_url TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`)
+	DB.Exec(`CREATE TABLE IF NOT EXISTS database_notification_preferences (
+        database_id INTEGER NOT NULL,
+        event_key TEXT NOT NULL,
+        enabled BOOLEAN NOT NULL DEFAULT 0,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (database_id, event_key),
+        FOREIGN KEY (database_id) REFERENCES databases(id)
+    )`)
+	DB.Exec(`CREATE TABLE IF NOT EXISTS system_notification_preferences (
+        event_key TEXT PRIMARY KEY,
+        enabled BOOLEAN NOT NULL DEFAULT 0,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`)
+	// One-time migration: backfill existing non-admin users with access to all
+	// existing projects to preserve legacy behavior during initial rollout.
+	// Guarded by a settings flag so it does not re-run on every restart.
+	var projectAccessBackfillDone string
+	err = DB.QueryRow("SELECT value FROM settings WHERE key = 'project_access_backfill_done'").Scan(&projectAccessBackfillDone)
+	if err == sql.ErrNoRows || projectAccessBackfillDone != "true" {
+		DB.Exec(`
+			INSERT OR IGNORE INTO user_project_access (user_id, project_id)
+			SELECT u.id, p.id
+			FROM users u
+			CROSS JOIN projects p
+			WHERE u.is_admin = 0
+		`)
+		DB.Exec("INSERT OR REPLACE INTO settings (key, value) VALUES ('project_access_backfill_done', 'true')")
+	}
 
 	return nil
 }

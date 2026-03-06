@@ -70,8 +70,17 @@ export function DatabaseProvider({ children }: DatabaseProviderProps) {
         );
         if (dbFromUrl) {
           setSelectedDatabase(dbFromUrl);
+        } else {
+          setSelectedDatabase(databasesList.length > 0 ? databasesList[0] : null);
         }
-      } else if (databasesList.length > 0 && !selectedDatabase) {
+      } else if (selectedDatabase) {
+        const stillAccessible = databasesList.find(
+          (db: Database) => db.id === selectedDatabase.id,
+        );
+        if (!stillAccessible) {
+          setSelectedDatabase(databasesList.length > 0 ? databasesList[0] : null);
+        }
+      } else if (databasesList.length > 0) {
         setSelectedDatabase(databasesList[0]);
       }
     } catch (error) {

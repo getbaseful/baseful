@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	"baseful/db"
 	"github.com/gin-gonic/gin"
 )
 
@@ -25,21 +26,25 @@ func AuthMiddleware() gin.HandlerFunc {
 			}
 		}
 
+		var tokenString string
 		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization header is required"})
-			c.Abort()
-			return
+		if authHeader != "" {
+			parts := strings.Fields(authHeader)
+			if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization header format must be Bearer {token}"})
+				c.Abort()
+				return
+			}
+			tokenString = parts[1]
+		} else {
+			cookie, err := c.Cookie("baseful_session")
+			if err != nil || strings.TrimSpace(cookie) == "" {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+				c.Abort()
+				return
+			}
+			tokenString = cookie
 		}
-
-		parts := strings.Split(authHeader, " ")
-		if len(parts) != 2 || parts[0] != "Bearer" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization header format must be Bearer {token}"})
-			c.Abort()
-			return
-		}
-
-		tokenString := parts[1]
 		claims, err := ValidateJWT(tokenString)
 		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired token"})
@@ -53,11 +58,25 @@ func AuthMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
+		if claims.UserID <= 0 {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid user token"})
+			c.Abort()
+			return
+		}
+
+		// Security hardening: always resolve current auth state from DB.
+		// This prevents stale/forged client-side role or permission display from granting API access.
+		user, err := db.GetUserByID(claims.UserID)
+		if err != nil || user == nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
+			c.Abort()
+			return
+		}
 
 		// Store user info in context
-		c.Set("user_id", claims.UserID)
-		c.Set("email", claims.Email)
-		c.Set("is_admin", claims.IsAdmin)
+		c.Set("user_id", user.ID)
+		c.Set("email", user.Email)
+		c.Set("is_admin", user.IsAdmin)
 
 		c.Next()
 	}

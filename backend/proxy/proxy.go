@@ -3,6 +3,7 @@ package proxy
 import (
 	"baseful/auth"
 	"baseful/db"
+	"baseful/system"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -290,6 +291,13 @@ func (p *ProxyServer) handleConnection(frontend net.Conn) {
 	newFrontend, startupParams, jwtToken, err := p.handleFrontendHandshake(frontend)
 	if err != nil {
 		p.logger.ConnectionFailed(clientIP, 0, p.port, "handshake failed", err)
+		system.NotifyGlobalEventAsync(
+			db.NotificationEventProxyGlobalFailed,
+			"Baseful proxy connection failed",
+			fmt.Sprintf("Handshake failed from %s at %s.\nError: %v", clientIP, time.Now().Format(time.RFC3339), err),
+			2*time.Minute,
+			clientIP,
+		)
 		p.sendError(frontend, "08000", "Connection handshake failed")
 		return
 	}
@@ -300,10 +308,25 @@ func (p *ProxyServer) handleConnection(frontend net.Conn) {
 	claims, err := auth.ValidateJWT(jwtToken)
 	if err != nil {
 		p.logger.TokenExpired("", clientIP)
+		system.NotifyGlobalEventAsync(
+			db.NotificationEventProxyGlobalProhibited,
+			"Baseful proxy connection prohibited",
+			fmt.Sprintf("Invalid/expired JWT from %s at %s.", clientIP, time.Now().Format(time.RFC3339)),
+			2*time.Minute,
+			clientIP,
+		)
 		p.sendError(frontend, "28000", "Invalid or expired JWT token")
 		return
 	}
 	if claims.Purpose != "db_proxy" {
+		system.NotifyDatabaseEventAsync(
+			claims.DatabaseID,
+			db.NotificationEventProxyConnectionProhibited,
+			"Baseful proxy connection prohibited",
+			fmt.Sprintf("Connection rejected for database ID %d from %s at %s (invalid token purpose).", claims.DatabaseID, clientIP, time.Now().Format(time.RFC3339)),
+			2*time.Minute,
+			clientIP,
+		)
 		p.sendError(frontend, "28000", "Invalid token purpose")
 		return
 	}
@@ -311,10 +334,26 @@ func (p *ProxyServer) handleConnection(frontend net.Conn) {
 	// Check if token has been revoked
 	if err := p.checkTokenRevocation(claims.TokenID); err != nil {
 		p.logger.TokenRevoked(claims.TokenID, clientIP)
+		system.NotifyDatabaseEventAsync(
+			claims.DatabaseID,
+			db.NotificationEventProxyConnectionProhibited,
+			"Baseful proxy connection prohibited",
+			fmt.Sprintf("Revoked token rejected for database ID %d from %s at %s.", claims.DatabaseID, clientIP, time.Now().Format(time.RFC3339)),
+			2*time.Minute,
+			claims.TokenID,
+		)
 		p.sendError(frontend, "28000", "Token has been revoked")
 		return
 	}
 	if err := p.checkTokenActive(claims, jwtToken); err != nil {
+		system.NotifyDatabaseEventAsync(
+			claims.DatabaseID,
+			db.NotificationEventProxyConnectionProhibited,
+			"Baseful proxy connection prohibited",
+			fmt.Sprintf("Invalid token rejected for database ID %d from %s at %s.\nError: %v", claims.DatabaseID, clientIP, time.Now().Format(time.RFC3339), err),
+			2*time.Minute,
+			claims.TokenID,
+		)
 		p.sendError(frontend, "28000", "Invalid or revoked JWT token")
 		return
 	}
@@ -325,6 +364,14 @@ func (p *ProxyServer) handleConnection(frontend net.Conn) {
 	dbInfo, err := db.GetDatabaseByID(claims.DatabaseID)
 	if err != nil {
 		p.logger.Warning("Database not found", nil, map[string]string{"database_id": fmt.Sprintf("%d", claims.DatabaseID)}, nil)
+		system.NotifyDatabaseEventAsync(
+			claims.DatabaseID,
+			db.NotificationEventProxyConnectionProhibited,
+			"Baseful proxy connection prohibited",
+			fmt.Sprintf("Connection attempted for unknown database ID %d from %s at %s.", claims.DatabaseID, clientIP, time.Now().Format(time.RFC3339)),
+			2*time.Minute,
+			clientIP,
+		)
 		p.sendError(frontend, "3D000", "Database not found")
 		return
 	}
@@ -354,6 +401,14 @@ func (p *ProxyServer) handleConnection(frontend net.Conn) {
 			"host": backendHost,
 			"port": fmt.Sprintf("%d", backendPort),
 		}, err)
+		system.NotifyDatabaseEventAsync(
+			claims.DatabaseID,
+			db.NotificationEventProxyConnectionFailed,
+			"Baseful proxy connection failed",
+			fmt.Sprintf("Backend connect failed for database ID %d (%s:%d) at %s.\nError: %v", claims.DatabaseID, backendHost, backendPort, time.Now().Format(time.RFC3339), err),
+			2*time.Minute,
+			fmt.Sprintf("%d", claims.DatabaseID),
+		)
 		p.sendError(frontend, "08006", fmt.Sprintf("Failed to connect to backend database at %s:%d", dbInfo.Host, dbInfo.Port))
 		return
 	}
@@ -362,6 +417,14 @@ func (p *ProxyServer) handleConnection(frontend net.Conn) {
 	err = p.handleBackendHandshake(backend, dbInfo, startupParams, frontend)
 	if err != nil {
 		p.logger.Warning("Backend handshake failed", nil, map[string]string{"error": err.Error()}, nil)
+		system.NotifyDatabaseEventAsync(
+			claims.DatabaseID,
+			db.NotificationEventProxyConnectionFailed,
+			"Baseful proxy connection failed",
+			fmt.Sprintf("Backend handshake failed for database ID %d from %s at %s.\nError: %v", claims.DatabaseID, clientIP, time.Now().Format(time.RFC3339), err),
+			2*time.Minute,
+			fmt.Sprintf("%d", claims.DatabaseID),
+		)
 		return
 	}
 

@@ -10,7 +10,8 @@ import CreateDatabaseDialog from "@/components/database/CreateDatabaseDialog";
 
 export default function Home() {
   const { databases, refreshDatabases } = useDatabase();
-  const { user } = useAuth();
+  const { user, hasPermission } = useAuth();
+  const canCreateDatabases = hasPermission("create_databases");
   const createGreeting = () => {
     const hour = new Date().getHours();
     if (hour < 12) return "Good morning";
@@ -29,12 +30,14 @@ export default function Home() {
             Select a database to manage or create a new one to get started.
           </p>
         </div>
-        <CreateDatabaseDialog onDatabaseCreated={refreshDatabases}>
-          <Button className="w-full md:w-auto gap-2 bg-blue-600 hover:bg-blue-500 text-white border-0">
-            <PlusIcon weight="bold" />
-            New Database
-          </Button>
-        </CreateDatabaseDialog>
+        {canCreateDatabases && (
+          <CreateDatabaseDialog onDatabaseCreated={refreshDatabases}>
+            <Button className="w-full md:w-auto gap-2 bg-blue-600 hover:bg-blue-500 text-white border-0">
+              <PlusIcon weight="bold" />
+              New Database
+            </Button>
+          </CreateDatabaseDialog>
+        )}
       </div>
 
       {databases && databases.length > 0 ? (
@@ -76,12 +79,14 @@ export default function Home() {
                 You haven't added any databases yet. Create your first database to start managing your data.
               </p>
             </div>
-            <CreateDatabaseDialog onDatabaseCreated={refreshDatabases}>
-              <Button variant="outline" className="mt-4 gap-2 hover:bg-neutral-800">
-                <PlusIcon weight="bold" />
-                Add First Database
-              </Button>
-            </CreateDatabaseDialog>
+            {canCreateDatabases && (
+              <CreateDatabaseDialog onDatabaseCreated={refreshDatabases}>
+                <Button variant="outline" className="mt-4 gap-2 hover:bg-neutral-800">
+                  <PlusIcon weight="bold" />
+                  Add First Database
+                </Button>
+              </CreateDatabaseDialog>
+            )}
           </CardContent>
         </Card>
       )}

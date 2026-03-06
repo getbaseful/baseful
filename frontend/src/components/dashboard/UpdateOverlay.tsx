@@ -25,12 +25,13 @@ const AuroraOverlayContent = () => (
 );
 
 export default function UpdateOverlay() {
-    const { token, logout } = useAuth();
+    const { token, logout, hasPermission } = useAuth();
+    const canAccessServer = hasPermission("server_access");
     const [isUpdating, setIsUpdating] = useState(false);
     const [currentHash, setCurrentHash] = useState<string | null>(null);
 
     useEffect(() => {
-        if (!token) return;
+        if (!token || !canAccessServer) return;
 
         const checkStatus = async () => {
             try {
@@ -60,7 +61,7 @@ export default function UpdateOverlay() {
         const interval = setInterval(checkStatus, isUpdating ? 2000 : 10000);
 
         return () => clearInterval(interval);
-    }, [token, isUpdating, currentHash]);
+    }, [token, isUpdating, currentHash, canAccessServer]);
 
     if (!isUpdating) return null;
 

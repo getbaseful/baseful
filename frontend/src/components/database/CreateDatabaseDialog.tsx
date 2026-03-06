@@ -104,12 +104,16 @@ export default function CreateDatabaseDialog({
     }
 
     try {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
+      if (token && token !== "__cookie_session__") {
+        headers["Authorization"] = `Bearer ${token}`;
+      }
       const response = await fetch("/api/databases", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`,
-        },
+        headers,
+        credentials: "include",
         body: JSON.stringify({
           name,
           type,

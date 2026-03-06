@@ -14,6 +14,7 @@ import {
   MagnifyingGlassIcon,
   PlusIcon,
   Globe,
+  BellSimpleIcon,
   CaretUpIcon,
 } from "@phosphor-icons/react";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
@@ -22,15 +23,21 @@ import { useProject } from "@/context/ProjectContext";
 import CreateDatabaseDialog from "../database/CreateDatabaseDialog";
 import CreateProjectDialog from "../project/CreateProjectDialog";
 import { DitherAvatar } from "../ui/hash-avatar";
+import { useAuth } from "@/context/AuthContext";
 
 export default function MobileDock() {
   const { selectedDatabase, databases, refreshDatabases } = useDatabase();
   const { projects, refreshProjects } = useProject();
+  const { hasPermission } = useAuth();
   const location = useLocation();
   const [isExpanded, setIsExpanded] = useState(false);
   const [createMenuOpen, setCreateMenuOpen] = useState(false);
   const [selectorOpen, setSelectorOpen] = useState(false);
   const [isDockVisible, setIsDockVisible] = useState(true);
+  const canCreateProjects = hasPermission("create_projects");
+  const canCreateDatabases = hasPermission("create_databases");
+  const canAccessServer = hasPermission("server_access");
+  const canManageNotifications = hasPermission("manage_notifications");
   // Handle scroll to hide/show dock
   const lastScrollY = useRef(0);
   const scrollTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -133,6 +140,13 @@ export default function MobileDock() {
             icon: ClockCounterClockwiseIcon,
             path: `/db/${selectedDatabase.id}/backup`,
           },
+          ...(canManageNotifications
+            ? [{
+              name: "DB Alerts",
+              icon: BellSimpleIcon,
+              path: `/db/${selectedDatabase.id}/notifications`,
+            }]
+            : []),
           {
             name: "Settings",
             icon: GearSixIcon,
@@ -140,26 +154,39 @@ export default function MobileDock() {
           },
         ],
       },
-      {
-        section: "SERVER",
-        items: [
-          {
-            name: "Monitoring",
-            icon: GraphIcon,
-            path: `/db/${selectedDatabase.id}/monitoring`,
-          },
-          {
-            name: "Containers",
-            icon: CubeIcon,
-            path: `/db/${selectedDatabase.id}/containers`,
-          },
-          {
-            name: "Web Server",
-            icon: Globe,
-            path: `/db/${selectedDatabase.id}/web-server`,
-          },
-        ],
-      },
+      ...((canAccessServer || canManageNotifications)
+        ? [{
+          section: "SERVER",
+          items: [
+            ...(canAccessServer
+              ? [{
+                name: "Monitoring",
+                icon: GraphIcon,
+                path: `/monitoring`,
+              }, {
+                name: "Containers",
+                icon: CubeIcon,
+                path: `/containers`,
+              }, {
+                name: "Web Server",
+                icon: Globe,
+                path: `/web-server`,
+              }, {
+                name: "Security",
+                icon: GearSixIcon,
+                path: `/security`,
+              }]
+              : []),
+            ...(canManageNotifications
+              ? [{
+                name: "Notification Center",
+                icon: BellSimpleIcon,
+                path: `/notifications`,
+              }]
+              : []),
+          ],
+        }]
+        : []),
     ]
     : [];
 
@@ -188,34 +215,38 @@ export default function MobileDock() {
             </div>
             <Popover open={createMenuOpen} onOpenChange={setCreateMenuOpen}>
               <PopoverTrigger asChild>
-                <div className="flex-1 bg-muted/50 text-sm  flex items-center gap-2 justify-center rounded-lg text-neutral-400 hover:text-neutral-300 transition-colors duration-200 cursor-pointer active:scale-95">
+                <div className={`flex-1 bg-muted/50 text-sm  flex items-center gap-2 justify-center rounded-lg text-neutral-400 hover:text-neutral-300 transition-colors duration-200 cursor-pointer active:scale-95 ${!canCreateProjects && !canCreateDatabases ? "opacity-50 pointer-events-none" : ""}`}>
                   <PlusIcon size={16} /> Create
                 </div>
               </PopoverTrigger>
               <PopoverContent className="w-fit p-2" align="end">
                 <div className="flex flex-col gap-1">
-                  <CreateProjectDialog
-                    onProjectCreated={() => {
-                      refreshProjects();
-                      setCreateMenuOpen(false);
-                      setIsExpanded(false);
-                    }}
-                  >
-                    <button className="flex focus:ring-0 flex-row items-center gap-2 p-2 rounded-md hover:bg-accent transition-colors text-left w-full">
-                      <span className="text-sm">New Project</span>
-                    </button>
-                  </CreateProjectDialog>
-                  <CreateDatabaseDialog
-                    onDatabaseCreated={() => {
-                      refreshDatabases();
-                      setCreateMenuOpen(false);
-                      setIsExpanded(false);
-                    }}
-                  >
-                    <button className="flex flex-row items-center gap-2 p-2 rounded-md hover:bg-accent transition-colors text-left w-full">
-                      <span className="text-sm">New Database</span>
-                    </button>
-                  </CreateDatabaseDialog>
+                  {canCreateProjects && (
+                    <CreateProjectDialog
+                      onProjectCreated={() => {
+                        refreshProjects();
+                        setCreateMenuOpen(false);
+                        setIsExpanded(false);
+                      }}
+                    >
+                      <button className="flex focus:ring-0 flex-row items-center gap-2 p-2 rounded-md hover:bg-accent transition-colors text-left w-full">
+                        <span className="text-sm">New Project</span>
+                      </button>
+                    </CreateProjectDialog>
+                  )}
+                  {canCreateDatabases && (
+                    <CreateDatabaseDialog
+                      onDatabaseCreated={() => {
+                        refreshDatabases();
+                        setCreateMenuOpen(false);
+                        setIsExpanded(false);
+                      }}
+                    >
+                      <button className="flex flex-row items-center gap-2 p-2 rounded-md hover:bg-accent transition-colors text-left w-full">
+                        <span className="text-sm">New Database</span>
+                      </button>
+                    </CreateDatabaseDialog>
+                  )}
                 </div>
               </PopoverContent>
             </Popover>
