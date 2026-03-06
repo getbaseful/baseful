@@ -2,6 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowClockwiseIcon,
   CubeIcon,
+  GlobeIcon,
+  ListBulletsIcon,
+  PlayIcon,
+  StopIcon,
   TerminalIcon,
   TerminalWindowIcon,
 } from "@phosphor-icons/react";
@@ -28,6 +32,9 @@ import { useAuth } from "@/context/AuthContext";
 import { authFetch } from "@/lib/api";
 import { ManageProjectDialog } from "@/components/ManageProjectDialog";
 import { DitherAvatar } from "@/components/ui/hash-avatar";
+import { LetterAvatar } from "@/components/ui/letter-avatar";
+import { UserManagementPanel } from "@/components/users/UserManagementPanel";
+import { toast } from "sonner";
 
 interface ContainerInfo {
   id: string;
@@ -40,13 +47,25 @@ interface ContainerInfo {
   created: number;
 }
 
+interface UserInfo {
+  id: number;
+  email: string;
+  avatarUrl?: string;
+}
+
 interface ProjectInfo {
   id: number;
   name: string;
-  users?: { id: number; email: string; avatarUrl?: string }[];
+  users?: UserInfo[];
 }
 
-type GraphKind = "project" | "service" | "container" | "network";
+interface ProxyInfo {
+  running: boolean;
+  port: number;
+  host: string;
+}
+
+type GraphKind = "internet" | "project" | "service" | "container" | "network";
 
 interface GraphNode {
   id: string;
@@ -56,10 +75,11 @@ interface GraphNode {
   version?: string;
   color: string;
   containerId?: string;
-  users?: { id: number; email: string; avatarUrl?: string }[];
+  users?: UserInfo[];
   ip?: string;
   status?: string;
   count?: number;
+  isSimulated?: boolean;
   x: number;
   y: number;
 }
@@ -68,7 +88,7 @@ interface GraphEdge {
   id: string;
   source: string;
   target: string;
-  kind: "belongs" | "exposes";
+  kind: "belongs" | "exposes" | "route";
 }
 
 interface MapViewport {
@@ -80,6 +100,9 @@ interface MapViewport {
 const NAME_FALLBACK = "unnamed";
 const MIN_SCALE = 0.35;
 const MAX_SCALE = 2.2;
+
+const BASEFUL_SIMULATED_LABEL = "baseful.simulated";
+const BASEFUL_SIMULATED_ID = "local-baseful-simulated";
 
 function getContainerName(container: ContainerInfo): string {
   return container.names?.[0]?.replace("/", "") || NAME_FALLBACK;
@@ -118,122 +141,47 @@ function inferProjectName(
   return name.toLowerCase() === "baseful" ? "Baseful" : name;
 }
 
+function isBasefulContainer(
+  container: ContainerInfo,
+  projectsById: Record<string, ProjectInfo> = {},
+): boolean {
+  const labels = container.labels || {};
+  const directProjectNames = [
+    labels["project"],
+    labels["com.docker.compose.project"],
+    labels["com.docker.stack.namespace"],
+  ];
+
+  if (directProjectNames.some((name) => name?.toLowerCase() === "baseful")) {
+    return true;
+  }
+
+  const basefulProjectId = labels["baseful.project_id"];
+  if (
+    basefulProjectId &&
+    basefulProjectId !== "0" &&
+    projectsById[basefulProjectId]?.name?.toLowerCase() === "baseful"
+  ) {
+    return true;
+  }
+
+  return (
+    inferProjectName(labels, projectsById).toLowerCase() === "baseful" ||
+    labels[BASEFUL_SIMULATED_LABEL] === "true"
+  );
+}
+
 function inferSubnet(ip: string): string {
   const parts = ip.split(".");
   if (parts.length !== 4) return "unknown-network";
   return `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
 }
 
-// A Safari-safe Facehash component for inside SVG foreignObject.
-// Replicates the Facehash aesthetic using pure SVG elements to avoid positioning bugs.
-// A Safari-safe Facehash component for inside SVG foreignObject.
-// Replicates the Facehash aesthetic using pure SVG elements to avoid positioning bugs.
-function FacehashSVG({ name, size = 24 }: { name: string; size?: number }) {
-  // Simple deterministic hash
-  let hash = 0;
-  for (let i = 0; i < name.length; i++) {
-    const char = name.charCodeAt(i);
-    hash = (hash << 5) - hash + char;
-    hash = hash & hash; // Convert to 32bit integer
-  }
-  const absHash = Math.abs(hash);
-
-  // Match the sidebars' bg colors
-  const colorHexes = ["#ea580c", "#2563eb", "#65a30d", "#9333ea"];
-  const bgColor = colorHexes[absHash % colorHexes.length];
-  const initial = name.charAt(0).toUpperCase();
-
-  // Face picking
-  const eyePaths = [
-    // RoundFace
-    {
-      viewBox: "0 0 63 15",
-      paths: [
-        "M14.4 7.2C14.4 11.1765 11.1765 14.4 7.2 14.4C3.22355 14.4 0 11.1765 0 7.2C0 3.22355 3.22355 0 7.2 0C11.1765 0 14.4 3.22355 14.4 7.2Z",
-        "M62.4 7.2C62.4 11.1765 59.1765 14.4 55.2 14.4C51.2236 14.4 48 11.1765 48 7.2C48 3.22355 51.2236 0 55.2 0C59.1765 0 62.4 3.22355 62.4 7.2Z",
-      ],
-    },
-    // CrossFace
-    {
-      viewBox: "0 0 71 23",
-      paths: [
-        "M11.5 0C12.9411 0 13.6619 0.000460386 14.1748 0.354492C14.3742 0.49213 14.547 0.664882 14.6846 0.864258C15.0384 1.37711 15.0391 2.09739 15.0391 3.53809V7.96094H19.4619C20.9027 7.96094 21.6229 7.9615 22.1357 8.31543C22.3352 8.45308 22.5079 8.62578 22.6455 8.8252C22.9995 9.3381 23 10.0589 23 11.5C23 12.9408 22.9995 13.661 22.6455 14.1738C22.5079 14.3733 22.3352 14.5459 22.1357 14.6836C21.6229 15.0375 20.9027 15.0381 19.4619 15.0381H15.0391V19.4619C15.0391 20.9026 15.0384 21.6229 14.6846 22.1357C14.547 22.3351 14.3742 22.5079 14.1748 22.6455C13.6619 22.9995 12.9411 23 11.5 23C10.0592 23 9.33903 22.9994 8.82617 22.6455C8.62674 22.5079 8.45309 22.3352 8.31543 22.1357C7.96175 21.6229 7.96191 20.9024 7.96191 19.4619V15.0381H3.53809C2.0973 15.0381 1.37711 15.0375 0.864258 14.6836C0.664834 14.5459 0.492147 14.3733 0.354492 14.1738C0.000498831 13.661 -5.88036e-08 12.9408 0 11.5C6.2999e-08 10.0589 0.000460356 9.3381 0.354492 8.8252C0.492144 8.62578 0.664842 8.45308 0.864258 8.31543C1.37711 7.9615 2.09731 7.96094 3.53809 7.96094H7.96191V3.53809C7.96191 2.09765 7.96175 1.37709 8.31543 0.864258C8.45309 0.664828 8.62674 0.492149 8.82617 0.354492C9.33903 0.000555366 10.0592 1.62347e-09 11.5 0Z",
-        "M58.7695 0C60.2107 0 60.9314 0.000460386 61.4443 0.354492C61.6437 0.49213 61.8165 0.664882 61.9541 0.864258C62.308 1.37711 62.3086 2.09739 62.3086 3.53809V7.96094H66.7314C68.1722 7.96094 68.8924 7.9615 69.4053 8.31543C69.6047 8.45308 69.7774 8.62578 69.915 8.8252C70.2691 9.3381 70.2695 10.0589 70.2695 11.5C70.2695 12.9408 70.269 13.661 69.915 14.1738C69.7774 14.3733 69.6047 14.5459 69.4053 14.6836C68.8924 15.0375 68.1722 15.0381 66.7314 15.0381H62.3086V19.4619C62.3086 20.9026 62.308 21.6229 61.9541 22.1357C61.8165 22.3351 61.6437 22.5079 61.4443 22.6455C60.9314 22.9995 60.2107 23 58.7695 23C57.3287 23 56.6086 22.9994 56.0957 22.6455C55.8963 22.5079 55.7226 22.3352 55.585 22.1357C55.2313 21.6229 55.2314 20.9024 55.2314 19.4619V15.0381H50.8076C49.3668 15.0381 48.6466 15.0375 48.1338 14.6836C47.9344 14.5459 47.7617 14.3733 47.624 14.1738C47.27 13.661 47.2695 12.9408 47.2695 11.5C47.2695 10.0589 47.27 9.3381 47.624 8.8252C47.7617 8.62578 47.9344 8.45308 48.1338 8.31543C48.6466 7.9615 49.3668 7.96094 50.8076 7.96094H55.2314V3.53809C55.2314 2.09765 55.2313 1.37709 55.585 0.864258C55.7226 0.664828 55.8963 0.492149 56.0957 0.354492C56.6086 0.000555366 57.3287 1.62347e-09 58.7695 0Z",
-      ],
-    },
-    // LineFace
-    {
-      viewBox: "0 0 82 8",
-      paths: [
-        "M3.53125 0.164063C4.90133 0.164063 5.58673 0.163893 6.08301 0.485352C6.31917 0.638428 6.52075 0.840012 6.67383 1.07617C6.99555 1.57252 6.99512 2.25826 6.99512 3.62891C6.99512 4.99911 6.99536 5.68438 6.67383 6.18066C6.52075 6.41682 6.31917 6.61841 6.08301 6.77148C5.58672 7.09305 4.90147 7.09277 3.53125 7.09277C2.16062 7.09277 1.47486 7.09319 0.978516 6.77148C0.742356 6.61841 0.540772 6.41682 0.387695 6.18066C0.0662401 5.68439 0.0664063 4.999 0.0664063 3.62891C0.0664063 2.25838 0.0660571 1.57251 0.387695 1.07617C0.540772 0.840012 0.742356 0.638428 0.978516 0.485352C1.47485 0.163744 2.16076 0.164063 3.53125 0.164063Z M25.1836 0.164063C26.5542 0.164063 27.24 0.163638 27.7363 0.485352C27.9724 0.638384 28.1731 0.8401 28.3262 1.07617C28.6479 1.57252 28.6484 2.25825 28.6484 3.62891C28.6484 4.99931 28.6478 5.68436 28.3262 6.18066C28.1731 6.41678 27.9724 6.61842 27.7363 6.77148C27.24 7.09321 26.5542 7.09277 25.1836 7.09277H11.3262C9.95557 7.09277 9.26978 7.09317 8.77344 6.77148C8.53728 6.61841 8.33569 6.41682 8.18262 6.18066C7.86115 5.68438 7.86133 4.99902 7.86133 3.62891C7.86133 2.25835 7.86096 1.57251 8.18262 1.07617C8.33569 0.840012 8.53728 0.638428 8.77344 0.485352C9.26977 0.163768 9.95572 0.164063 11.3262 0.164063H25.1836Z",
-        "M78.2034 7.09325C76.8333 7.09325 76.1479 7.09342 75.6516 6.77197C75.4155 6.61889 75.2139 6.4173 75.0608 6.18114C74.7391 5.6848 74.7395 4.99905 74.7395 3.62841C74.7395 2.2582 74.7393 1.57294 75.0608 1.07665C75.2139 0.840493 75.4155 0.638909 75.6516 0.485832C76.1479 0.164271 76.8332 0.164543 78.2034 0.164543C79.574 0.164543 80.2598 0.164122 80.7561 0.485832C80.9923 0.638909 81.1939 0.840493 81.347 1.07665C81.6684 1.57293 81.6682 2.25831 81.6682 3.62841C81.6682 4.99894 81.6686 5.68481 81.347 6.18114C81.1939 6.4173 80.9923 6.61889 80.7561 6.77197C80.2598 7.09357 79.5739 7.09325 78.2034 7.09325Z M56.5511 7.09325C55.1804 7.09325 54.4947 7.09368 53.9983 6.77197C53.7622 6.61893 53.5615 6.41722 53.4085 6.18114C53.0868 5.6848 53.0862 4.99907 53.0862 3.62841C53.0862 2.258 53.0868 1.57296 53.4085 1.07665C53.5615 0.840539 53.7622 0.638898 53.9983 0.485832C54.4947 0.164105 55.1804 0.164543 56.5511 0.164543H70.4085C71.7791 0.164543 72.4649 0.164146 72.9612 0.485832C73.1974 0.638909 73.399 0.840493 73.552 1.07665C73.8735 1.57293 73.8733 2.25829 73.8733 3.62841C73.8733 4.99896 73.8737 5.68481 73.552 6.18114C73.399 6.4173 73.1974 6.61889 72.9612 6.77197C72.4649 7.09355 71.7789 7.09325 70.4085 7.09325H56.5511Z",
-      ],
-    },
-    // CurvedFace
-    {
-      viewBox: "0 0 63 9",
-      paths: [
-        "M0 5.06511C0 4.94513 0 4.88513 0.00771184 4.79757C0.0483059 4.33665 0.341025 3.76395 0.690821 3.46107C0.757274 3.40353 0.783996 3.38422 0.837439 3.34559C2.40699 2.21129 6.03888 0 10.5 0C14.9611 0 18.593 2.21129 20.1626 3.34559C20.216 3.38422 20.2427 3.40353 20.3092 3.46107C20.659 3.76395 20.9517 4.33665 20.9923 4.79757C21 4.88513 21 4.94513 21 5.06511C21 6.01683 21 6.4927 20.9657 6.6754C20.7241 7.96423 19.8033 8.55941 18.5289 8.25054C18.3483 8.20676 17.8198 7.96876 16.7627 7.49275C14.975 6.68767 12.7805 6 10.5 6C8.21954 6 6.02504 6.68767 4.23727 7.49275C3.18025 7.96876 2.65174 8.20676 2.47108 8.25054C1.19668 8.55941 0.275917 7.96423 0.0342566 6.6754C0 6.4927 0 6.01683 0 5.06511Z",
-        "M42 5.06511C42 4.94513 42 4.88513 42.0077 4.79757C42.0483 4.33665 42.341 3.76395 42.6908 3.46107C42.7573 3.40353 42.784 3.38422 42.8374 3.34559C44.407 2.21129 48.0389 0 52.5 0C56.9611 0 60.593 2.21129 62.1626 3.34559C62.216 3.38422 62.2427 3.40353 62.3092 3.46107C62.659 3.76395 62.9517 4.33665 62.9923 4.79757C63 4.88513 63 4.94513 63 5.06511C63 6.01683 63 6.4927 62.9657 6.6754C62.7241 7.96423 61.8033 8.55941 60.5289 8.25054C60.3483 8.20676 59.8198 7.96876 58.7627 7.49275C56.975 6.68767 54.7805 6 52.5 6C50.2195 6 48.025 6.68767 46.2373 7.49275C45.1802 7.96876 44.6517 8.20676 44.4711 8.25054C43.1967 8.55941 42.2759 7.96423 42.0343 6.6754C42 6.4927 42 6.01683 42 5.06511Z",
-      ],
-    },
-  ];
-  const face = eyePaths[absHash % eyePaths.length];
-
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox={`0 0 ${size} ${size}`}
-      style={{ display: "block" }}
-    >
-      <defs>
-        <radialGradient
-          id={`grad-${absHash}`}
-          cx="50%"
-          cy="50%"
-          r="50%"
-          fx="50%"
-          fy="50%"
-        >
-          <stop offset="0%" stopColor="white" stopOpacity="0.15" />
-          <stop offset="60%" stopColor="white" stopOpacity="0" />
-        </radialGradient>
-      </defs>
-      {/* Background */}
-      <rect width={size} height={size} fill={bgColor} rx={4} />
-      {/* Gradient Overlay */}
-      <rect width={size} height={size} fill={`url(#grad-${absHash})`} rx={4} />
-
-      {/* Face Content */}
-      <g
-        transform={`translate(${size * 0.2}, ${size * 0.25}) scale(${(size * 0.6) / parseInt(face.viewBox.split(" ")[2])})`}
-      >
-        {face.paths.map((d, i) => (
-          <path key={i} d={d} fill="white" />
-        ))}
-      </g>
-
-      {/* Initial */}
-      <text
-        x="50%"
-        y="75%"
-        textAnchor="middle"
-        fill="white"
-        fontSize={size * 0.26}
-        fontFamily="system-ui, sans-serif"
-        fontWeight="bold"
-        style={{ pointerEvents: "none" }}
-      >
-        {initial}
-      </text>
-    </svg>
-  );
-}
-
 function buildTopology(
   containers: ContainerInfo[],
   projectsById: Record<string, ProjectInfo>,
+  allUsers: UserInfo[],
+  proxyInfo: ProxyInfo | null,
 ): { nodes: GraphNode[]; edges: GraphEdge[] } {
   const projectSet = new Set<string>();
   const networkSet = new Set<string>();
@@ -262,8 +210,9 @@ function buildTopology(
   const edges: GraphEdge[] = [];
 
   const xByKind: Record<GraphKind, number> = {
+    internet: -140,
     project: 120,
-    service: 400, // Kept in interface but not used in layout
+    service: 400,
     container: 560,
     network: 920,
   };
@@ -275,19 +224,17 @@ function buildTopology(
   projects.forEach((project) => {
     projectY.set(project, currentY);
 
-    // Find the project info to get the users
-    const projectInfo = Object.entries(projectsById).find(
-      ([_, p]) => p.name === project,
+    const projectInfo = Object.values(projectsById).find(
+      (p) => p.name.toLowerCase() === project.toLowerCase(),
     );
-    const users = projectInfo ? projectInfo[1].users : undefined;
+    const users = projectInfo?.users;
 
     let label = project;
     let finalUsers = users;
 
     if (project.toLowerCase() === "baseful") {
       label = "Baseful";
-      // Specific single user for baseful project avatar
-      finalUsers = [{ id: 0, email: "baseful@system", avatarUrl: "/logo.png" }];
+      finalUsers = allUsers;
     }
 
     nodes.push({
@@ -302,6 +249,67 @@ function buildTopology(
     });
     currentY += yGap;
   });
+
+  if (proxyInfo) {
+    const preferredProxyProject = projectY.has("Baseful")
+      ? "Baseful"
+      : projects.length > 0
+        ? projects[0]
+        : null;
+    const projectAnchorY =
+      (preferredProxyProject
+        ? projectY.get(preferredProxyProject)
+        : undefined) || 80;
+    const projectRows = Array.from(projectY.values());
+    const minRowDistance = 170;
+    const yCandidates = [
+      projectAnchorY - 220,
+      projectAnchorY + 220,
+      projectAnchorY - 320,
+      projectAnchorY + 320,
+      projectAnchorY + 420,
+    ];
+    const proxyY =
+      yCandidates.find((candidate) =>
+        projectRows.every(
+          (rowY) => Math.abs(rowY - candidate) >= minRowDistance,
+        ),
+      ) || projectAnchorY + 520;
+    const proxyX =
+      preferredProxyProject && preferredProxyProject.toLowerCase() === "baseful"
+        ? xByKind.project
+        : xByKind.service;
+    const internetY = proxyY;
+
+    nodes.push({
+      id: "internet:public",
+      kind: "internet",
+      label: "Client Access",
+      detail: "ingress",
+      color: "#1f2937",
+      x: xByKind.internet,
+      y: internetY,
+    });
+
+    nodes.push({
+      id: "service:proxy",
+      kind: "service",
+      label: "Baseful Proxy",
+      detail: proxyInfo.running ? "running" : "stopped",
+      version: `${proxyInfo.host}:${proxyInfo.port}`,
+      status: proxyInfo.running ? "Running" : "Stopped",
+      color: proxyInfo.running ? "#0f5132" : "#4b5563",
+      x: proxyX,
+      y: proxyY,
+    });
+
+    edges.push({
+      id: "edge:internet:public:service:proxy",
+      source: "internet:public",
+      target: "service:proxy",
+      kind: "route",
+    });
+  }
 
   currentY = 80;
 
@@ -319,6 +327,11 @@ function buildTopology(
 
     const [imageNamePath, rawVersion = ""] = container.image.split(":");
     const imageName = imageNamePath.split("/").pop() || "";
+    const imageNameLower = imageName.toLowerCase();
+    const isDatabaseContainer =
+      Boolean(container.labels?.["baseful.database"]) ||
+      Boolean(container.labels?.["baseful.branch"]) ||
+      imageNameLower.startsWith("postgres");
     // Hide version if it's a sha256 hash or is unusually long
     const isShaOrLong =
       rawVersion.startsWith("sha256") || rawVersion.length > 20;
@@ -335,16 +348,28 @@ function buildTopology(
       version: versionStr,
       color: container.state === "running" ? "#0f5132" : "#4b5563",
       containerId: container.id,
+      isSimulated: container.labels[BASEFUL_SIMULATED_LABEL] === "true",
       x: xByKind.container,
       y: currentY,
     });
 
+    // Keep structural ownership link for all containers.
     edges.push({
       id: `edge:project:${project}:container:${container.id}`,
       source: `project:${project}`,
       target: `container:${container.id}`,
       kind: "belongs",
     });
+
+    // Overlay route link only for DB/branch postgres traffic through proxy.
+    if (proxyInfo && isDatabaseContainer) {
+      edges.push({
+        id: `edge:service:proxy:container:${container.id}`,
+        source: "service:proxy",
+        target: `container:${container.id}`,
+        kind: "route",
+      });
+    }
 
     if (container.ip) {
       const subnet = inferSubnet(container.ip);
@@ -432,13 +457,15 @@ const DockerLogoSVG = ({ className }: { className?: string }) => (
 );
 
 export default function Containers() {
-  const { token, logout } = useAuth();
+  const { token, logout, user } = useAuth();
   const [containers, setContainers] = useState<ContainerInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [projectsById, setProjectsById] = useState<Record<string, ProjectInfo>>(
     {},
   );
+  const [allUsers, setAllUsers] = useState<UserInfo[]>([]);
+  const [proxyInfo, setProxyInfo] = useState<ProxyInfo | null>(null);
   const [selectedContainer, setSelectedContainer] =
     useState<ContainerInfo | null>(null);
   const [containerHistory, setContainerHistory] = useState<
@@ -461,11 +488,20 @@ export default function Containers() {
   });
 
   const [manageProjectDialogOpen, setManageProjectDialogOpen] = useState(false);
+  const [basefulUsersDrawerOpen, setBasefulUsersDrawerOpen] = useState(false);
   const [selectedManageProject, setSelectedManageProject] = useState<{
     id: number;
     name: string;
   } | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [containerActionLoading, setContainerActionLoading] = useState<
+    Record<string, "start" | "stop" | "restart" | "logs" | undefined>
+  >({});
+  const [logsDialogOpen, setLogsDialogOpen] = useState(false);
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [logsContainerName, setLogsContainerName] = useState("");
+  const [logsContent, setLogsContent] = useState("");
+  const [isMobileDrawer, setIsMobileDrawer] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -497,21 +533,45 @@ export default function Containers() {
     }
   }, [executing, selectedContainer]);
 
+  useEffect(() => {
+    const updateMobileDrawer = () => {
+      if (typeof window === "undefined") return;
+      setIsMobileDrawer(window.innerWidth < 768);
+    };
+    updateMobileDrawer();
+    window.addEventListener("resize", updateMobileDrawer);
+    return () => window.removeEventListener("resize", updateMobileDrawer);
+  }, []);
+
   const fetchContainers = useCallback(async () => {
     try {
       setLoading(true);
-      const [containersResponse, projectsResponse] = await Promise.all([
+      const [
+        containersResponse,
+        projectsResponse,
+        usersResponse,
+        proxyResponse,
+      ] = await Promise.all([
         authFetch("/api/docker/containers", token, {}, logout),
         authFetch("/api/projects", token, {}, logout),
+        user?.isAdmin
+          ? authFetch("/api/auth/users", token, {}, logout)
+          : Promise.resolve(null),
+        authFetch("/api/docker/proxy", token, {}, logout),
       ]);
 
       if (!containersResponse.ok) throw new Error("Failed to fetch containers");
-      const containerData = await containersResponse.json();
-      setContainers(containerData);
+      const rawContainerData: ContainerInfo[] = await containersResponse.json();
+      let projectMap: Record<string, ProjectInfo> = {};
+
+      const isLocal =
+        typeof window !== "undefined" &&
+        (window.location.hostname === "localhost" ||
+          window.location.hostname === "127.0.0.1");
 
       if (projectsResponse.ok) {
         const projectsData: ProjectInfo[] = await projectsResponse.json();
-        const projectMap = projectsData.reduce(
+        projectMap = projectsData.reduce(
           (acc, project) => {
             acc[String(project.id)] = project;
             return acc;
@@ -520,19 +580,177 @@ export default function Containers() {
         );
         setProjectsById(projectMap);
       }
+
+      const hasBasefulContainer = rawContainerData.some((container) =>
+        isBasefulContainer(container, projectMap),
+      );
+
+      let containerData =
+        user?.isAdmin && isLocal && !hasBasefulContainer
+          ? [
+              ...rawContainerData,
+              {
+                id: BASEFUL_SIMULATED_ID,
+                names: ["/baseful-local"],
+                image: "baseful/dashboard:local",
+                status: "Simulated (local only)",
+                state: "running",
+                ip: "127.0.0.1",
+                labels: {
+                  project: "baseful",
+                  [BASEFUL_SIMULATED_LABEL]: "true",
+                },
+                created: 0,
+              },
+            ]
+          : rawContainerData;
+
+      if (!user?.isAdmin) {
+        containerData = containerData.filter(
+          (container) => !isBasefulContainer(container, projectMap),
+        );
+        setBasefulUsersDrawerOpen(false);
+      }
+
+      setContainers(containerData);
+
+      if (usersResponse?.ok) {
+        const usersData: UserInfo[] = await usersResponse.json();
+        setAllUsers(usersData || []);
+      } else {
+        setAllUsers([]);
+      }
+
+      if (proxyResponse.ok) {
+        const proxyData: ProxyInfo = await proxyResponse.json();
+        setProxyInfo(proxyData);
+      } else {
+        setProxyInfo(null);
+      }
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "An error occurred");
     } finally {
       setLoading(false);
     }
-  }, [token, logout]);
+  }, [token, logout, user?.isAdmin]);
 
   useEffect(() => {
     fetchContainers();
     const interval = setInterval(fetchContainers, 30000);
     return () => clearInterval(interval);
   }, [fetchContainers]);
+
+  const handleContainerAction = useCallback(
+    async (container: ContainerInfo, action: "start" | "stop" | "restart") => {
+      if (container.id === BASEFUL_SIMULATED_ID) return;
+      setContainerActionLoading((prev) => ({
+        ...prev,
+        [container.id]: action,
+      }));
+      try {
+        const response = await authFetch(
+          `/api/docker/containers/${container.id}/${action}`,
+          token,
+          { method: "POST" },
+          logout,
+        );
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data?.error || `Failed to ${action} container`);
+        }
+        toast.success(
+          action === "restart"
+            ? "Container restarted"
+            : `Container ${action === "start" ? "started" : "stopped"}`,
+        );
+        await fetchContainers();
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "Action failed");
+      } finally {
+        setContainerActionLoading((prev) => ({
+          ...prev,
+          [container.id]: undefined,
+        }));
+      }
+    },
+    [fetchContainers, logout, token],
+  );
+
+  const openContainerLogs = useCallback(
+    async (container: ContainerInfo) => {
+      if (container.id === BASEFUL_SIMULATED_ID) return;
+      setContainerActionLoading((prev) => ({
+        ...prev,
+        [container.id]: "logs",
+      }));
+      setLogsLoading(true);
+      setLogsContent("");
+      setLogsContainerName(getContainerDisplayNames(container).clean);
+      setLogsDialogOpen(true);
+      try {
+        const response = await authFetch(
+          `/api/docker/containers/${container.id}/logs?tail=200`,
+          token,
+          {},
+          logout,
+        );
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data?.error || "Failed to fetch logs");
+        }
+        setLogsContent(data?.logs || "");
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Failed to fetch logs";
+        setLogsContent(`Error: ${message}`);
+        toast.error(message);
+      } finally {
+        setLogsLoading(false);
+        setContainerActionLoading((prev) => ({
+          ...prev,
+          [container.id]: undefined,
+        }));
+      }
+    },
+    [logout, token],
+  );
+
+  const openProxyLogs = useCallback(async () => {
+    const proxyNodeId = "service:proxy";
+    setContainerActionLoading((prev) => ({
+      ...prev,
+      [proxyNodeId]: "logs",
+    }));
+    setLogsLoading(true);
+    setLogsContent("");
+    setLogsContainerName("Baseful Proxy");
+    setLogsDialogOpen(true);
+    try {
+      const response = await authFetch(
+        "/api/docker/proxy/logs?tail=300",
+        token,
+        {},
+        logout,
+      );
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || "Failed to fetch proxy logs");
+      }
+      setLogsContent(data?.logs || "");
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to fetch proxy logs";
+      setLogsContent(`Error: ${message}`);
+      toast.error(message);
+    } finally {
+      setLogsLoading(false);
+      setContainerActionLoading((prev) => ({
+        ...prev,
+        [proxyNodeId]: undefined,
+      }));
+    }
+  }, [logout, token]);
 
   const handleExecute = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -693,8 +911,8 @@ export default function Containers() {
   };
 
   const topology = useMemo(
-    () => buildTopology(containers, projectsById),
-    [containers, projectsById],
+    () => buildTopology(containers, projectsById, allUsers, proxyInfo),
+    [containers, projectsById, allUsers, proxyInfo],
   );
   const nodeById = useMemo(
     () => Object.fromEntries(topology.nodes.map((n) => [n.id, n])),
@@ -964,6 +1182,56 @@ export default function Containers() {
     return { nodeIds, edgeIds };
   }, [selectedNodeId, topology.edges]);
 
+  const proxyRouteBundle = useMemo(() => {
+    const proxyNode = nodeById["service:proxy"];
+    if (!proxyNode) return null;
+    const containerAnchorOffsetY = -16;
+
+    const bundledRoutes = topology.edges
+      .filter(
+        (edge) =>
+          edge.kind === "route" &&
+          edge.source === "service:proxy" &&
+          edge.target.startsWith("container:"),
+      )
+      .map((edge) => ({ edgeId: edge.id, node: nodeById[edge.target] }))
+      .filter((item): item is { edgeId: string; node: GraphNode } =>
+        Boolean(item.node),
+      )
+      .map((item) => ({
+        ...item,
+        routeY: item.node.y + containerAnchorOffsetY,
+      }));
+
+    if (bundledRoutes.length === 0) return null;
+
+    const proxyConnectorX = proxyNode.x + 110;
+    const nearestTargetConnectorX = Math.min(
+      ...bundledRoutes.map((item) => item.node.x - 110),
+    );
+    const rawTrunkX =
+      proxyConnectorX + (nearestTargetConnectorX - proxyConnectorX) * 0.8;
+    // Keep the vertical trunk outside container cards to avoid lines crossing cards.
+    const trunkX = Math.round(Math.min(rawTrunkX, nearestTargetConnectorX - 24));
+    const trunkMinY = Math.min(
+      proxyNode.y,
+      ...bundledRoutes.map((item) => item.routeY),
+    );
+    const trunkMaxY = Math.max(
+      proxyNode.y,
+      ...bundledRoutes.map((item) => item.routeY),
+    );
+
+    return {
+      proxyNode,
+      proxyConnectorX,
+      trunkX,
+      trunkMinY,
+      trunkMaxY,
+      bundledRoutes,
+    };
+  }, [nodeById, topology.edges]);
+
   const renderTerminalDialogContent = () => (
     <DialogContent className="sm:max-w-[85vw] w-full h-[85vh] flex flex-col p-0 gap-0 bg-[#0c0c0c] border-neutral-800 text-neutral-200 shadow-2xl overflow-hidden focus:outline-none">
       <DialogHeader className="px-4 py-3 border-b border-neutral-800 bg-neutral-900/50">
@@ -1222,8 +1490,37 @@ export default function Containers() {
                     const source = nodeById[edge.source];
                     const target = nodeById[edge.target];
                     if (!source || !target) return null;
+                    if (
+                      edge.kind === "route" &&
+                      edge.source === "service:proxy" &&
+                      edge.target.startsWith("container:")
+                    ) {
+                      return null;
+                    }
 
                     const isRelated = highlightedGraph.edgeIds.has(edge.id);
+                    const isRoute = edge.kind === "route";
+                    const stroke = isRoute
+                      ? isRelated
+                        ? "#7c8ca3"
+                        : "#5a6678"
+                      : isRelated
+                        ? "#6b7280"
+                        : "#3f3f46";
+                    const opacity = isRoute
+                      ? isRelated
+                        ? 0.8
+                        : 0.45
+                      : isRelated
+                        ? 1
+                        : 0.4;
+                    const width = isRoute
+                      ? isRelated
+                        ? 1.6
+                        : 1.2
+                      : isRelated
+                        ? 2
+                        : 1.5;
 
                     return (
                       <line
@@ -1232,17 +1529,94 @@ export default function Containers() {
                         y1={source.y}
                         x2={target.x - 110}
                         y2={target.y}
-                        stroke={isRelated ? "#6b7280" : "#3f3f46"}
-                        strokeOpacity={isRelated ? 1 : 0.4}
-                        strokeWidth={isRelated ? 2 : 1.5}
+                        stroke={stroke}
+                        strokeOpacity={opacity}
+                        strokeWidth={width}
+                        strokeDasharray={isRoute ? "4 6" : undefined}
                       />
                     );
                   })}
+
+                  {proxyRouteBundle && (
+                    <>
+                      <line
+                        x1={proxyRouteBundle.proxyConnectorX}
+                        y1={proxyRouteBundle.proxyNode.y}
+                        x2={proxyRouteBundle.trunkX}
+                        y2={proxyRouteBundle.proxyNode.y}
+                        stroke={
+                          selectedNodeId === "service:proxy"
+                            ? "#7c8ca3"
+                            : "#5a6678"
+                        }
+                        strokeOpacity={
+                          selectedNodeId === "service:proxy" ? 0.8 : 0.45
+                        }
+                        strokeWidth={
+                          selectedNodeId === "service:proxy" ? 1.6 : 1.2
+                        }
+                        strokeDasharray="4 6"
+                      />
+                      <line
+                        x1={proxyRouteBundle.trunkX}
+                        y1={proxyRouteBundle.trunkMinY}
+                        x2={proxyRouteBundle.trunkX}
+                        y2={proxyRouteBundle.trunkMaxY}
+                        stroke={
+                          selectedNodeId === "service:proxy"
+                            ? "#7c8ca3"
+                            : "#5a6678"
+                        }
+                        strokeOpacity={
+                          selectedNodeId === "service:proxy" ? 0.8 : 0.45
+                        }
+                        strokeWidth={
+                          selectedNodeId === "service:proxy" ? 1.6 : 1.2
+                        }
+                        strokeDasharray="4 6"
+                      />
+                      {proxyRouteBundle.bundledRoutes.map((item) => {
+                        const isRelated =
+                          highlightedGraph.edgeIds.has(item.edgeId) ||
+                          highlightedGraph.nodeIds.has(item.node.id) ||
+                          selectedNodeId === "service:proxy";
+
+                        return (
+                          <line
+                            key={`bundle:${item.edgeId}`}
+                            x1={proxyRouteBundle.trunkX}
+                            y1={item.routeY}
+                            x2={item.node.x - 110}
+                            y2={item.routeY}
+                            stroke={isRelated ? "#7c8ca3" : "#5a6678"}
+                            strokeOpacity={isRelated ? 0.8 : 0.45}
+                            strokeWidth={isRelated ? 1.6 : 1.2}
+                            strokeDasharray="4 6"
+                          />
+                        );
+                      })}
+                    </>
+                  )}
 
                   {topology.nodes.map((node) => {
                     const isContainer = node.kind === "container";
                     const isSelected = selectedNodeId === node.id;
                     const isRelated = highlightedGraph.nodeIds.has(node.id);
+                    const outboundRouteCount = topology.edges.filter(
+                      (edge) =>
+                        edge.source === node.id && edge.kind === "route",
+                    ).length;
+                    const containerMatch =
+                      isContainer && node.containerId
+                        ? containers.find((c) => c.id === node.containerId)
+                        : undefined;
+                    const cardWidth = node.kind === "internet" ? 232 : 220;
+                    const cardHeight =
+                      node.kind === "internet"
+                        ? 164
+                        : node.kind === "service"
+                          ? 188
+                          : 150;
 
                     let iconNode = (
                       <CubeIcon className="w-4 h-4 text-neutral-400" />
@@ -1250,20 +1624,36 @@ export default function Containers() {
                     let nodeTypeStr = "Node";
 
                     if (node.kind === "project") {
-                      iconNode = <DitherAvatar value={node.label} size={16} />;
+                      const isBaseful = node.label.toLowerCase() === "baseful";
+                      iconNode = isBaseful ? (
+                        <img
+                          src="/logo.png"
+                          alt="Baseful"
+                          className="w-4 h-4 rounded-sm object-contain"
+                        />
+                      ) : (
+                        <DitherAvatar value={node.label} size={16} />
+                      );
                       nodeTypeStr = "Project";
                     } else if (node.kind === "service") {
                       iconNode = (
                         <ServiceIconSVG className="w-4 h-4 text-neutral-400" />
                       );
                       nodeTypeStr = "Service";
+                    } else if (node.kind === "internet") {
+                      iconNode = (
+                        <GlobeIcon className="w-4 h-4 text-blue-300" />
+                      );
+                      nodeTypeStr = "Internet";
                     } else if (node.kind === "network") {
                       iconNode = (
                         <NetworkIconSVG className="w-4 h-4 text-neutral-400" />
                       );
                       nodeTypeStr = "Network";
                     } else if (isContainer) {
-                      iconNode = (
+                      iconNode = node.isSimulated ? (
+                        <CubeIcon className="w-4 h-4 text-amber-300" />
+                      ) : (
                         <DockerLogoSVG className="w-4 h-4 text-neutral-300" />
                       );
                       nodeTypeStr = "Container";
@@ -1272,20 +1662,21 @@ export default function Containers() {
                     return (
                       <g key={node.id} style={{ cursor: "default" }}>
                         <foreignObject
-                          x={node.x - 120}
-                          y={node.y - 85}
-                          width={240}
-                          height={170}
+                          x={node.x - cardWidth / 2 - 10}
+                          y={node.y - cardHeight / 2 - 10}
+                          width={cardWidth + 20}
+                          height={cardHeight + 20}
                         >
                           <div className="w-full h-full p-2.5 flex items-center justify-center">
                             <div
-                              className={`w-[220px] h-[150px] rounded-[10px] border flex flex-col select-none transition-colors overflow-hidden ${
+                              className={`rounded-[10px] border flex flex-col select-none transition-colors overflow-hidden ${
                                 isSelected
                                   ? "bg-neutral-800 border-neutral-500 shadow-xl"
                                   : isRelated
                                     ? "bg-[#181818] border-neutral-600 shadow-md"
                                     : "bg-[#121212] border-[#2a2a2a] shadow-md hover:border-[#3e3e3e]"
                               }`}
+                              style={{ width: cardWidth, height: cardHeight }}
                               onClick={() => {
                                 if (panStateRef.current.moved) return;
                                 setSelectedNodeId(node.id);
@@ -1306,11 +1697,24 @@ export default function Containers() {
                                     {node.label}
                                   </span>
                                   <div className="flex items-center gap-1.5 flex-shrink-0">
-                                    {node.version && (
-                                      <span className="text-[10px] tracking-tight uppercase text-neutral-400 font-medium px-1.5 py-0.5 bg-[#1f1f1f] rounded border border-[#2a2a2a]">
-                                        {node.version}
+                                    {node.kind === "service" && (
+                                      <span
+                                        className={`text-[10px] tracking-tight uppercase font-medium px-1.5 py-0.5 rounded border ${
+                                          node.status?.toLowerCase() ===
+                                          "running"
+                                            ? "text-emerald-300 bg-emerald-500/10 border-emerald-500/30"
+                                            : "text-neutral-300 bg-neutral-700/30 border-neutral-600"
+                                        }`}
+                                      >
+                                        {node.status || "Unknown"}
                                       </span>
                                     )}
+                                    {node.version &&
+                                      node.kind !== "service" && (
+                                        <span className="text-[10px] tracking-tight uppercase text-neutral-400 font-medium px-1.5 py-0.5 bg-[#1f1f1f] rounded border border-[#2a2a2a]">
+                                          {node.version}
+                                        </span>
+                                      )}
                                   </div>
                                 </div>
                               </div>
@@ -1341,25 +1745,33 @@ export default function Containers() {
                                       Project Members
                                     </span>
                                     <div className="flex -space-x-1.5 overflow-hidden">
-                                      {node.users?.map((u, i) => (
-                                        <div
-                                          key={i}
-                                          className="inline-block h-6 w-6 rounded-full border-2 border-[#121212] flex items-center justify-center overflow-hidden bg-muted"
-                                        >
-                                          {u.avatarUrl ? (
-                                            <img
-                                              src={u.avatarUrl}
-                                              className="size-full object-cover"
-                                              alt=""
-                                            />
-                                          ) : (
-                                            <FacehashSVG
-                                              name={u.email}
-                                              size={24}
-                                            />
-                                          )}
+                                      {(node.users || [])
+                                        .slice(0, 7)
+                                        .map((u, i) => (
+                                          <div
+                                            key={i}
+                                            className="h-6 w-6 rounded-full border-2 border-neutral-700 flex items-center justify-center overflow-hidden bg-muted"
+                                          >
+                                            {u.avatarUrl ? (
+                                              <img
+                                                src={u.avatarUrl}
+                                                className="size-full object-cover"
+                                                alt=""
+                                              />
+                                            ) : (
+                                              <LetterAvatar
+                                                name={u.email}
+                                                size={20}
+                                                className="rounded-full"
+                                              />
+                                            )}
+                                          </div>
+                                        ))}
+                                      {(node.users?.length || 0) > 7 && (
+                                        <div className="inline-flex h-6 min-w-6 px-1 rounded-full border-2 border-neutral-700 items-center justify-center bg-neutral-800 text-[10px] font-semibold text-neutral-200">
+                                          +{(node.users?.length || 0) - 7}
                                         </div>
-                                      ))}
+                                      )}
                                       {(!node.users ||
                                         node.users.length === 0) && (
                                         <span className="text-[10px] text-neutral-500 italic">
@@ -1383,6 +1795,83 @@ export default function Containers() {
                                       </span>
                                     </div>
                                   </div>
+                                ) : node.kind === "service" ? (
+                                  <div className="space-y-2">
+                                    <div className="flex flex-col gap-0.5">
+                                      <span className="text-[9px] text-neutral-500 font-bold uppercase tracking-widest">
+                                        Endpoint
+                                      </span>
+                                      <span className="text-[10px] text-neutral-300 font-mono bg-neutral-900/50 px-1.5 py-0.5 rounded border border-white/5 w-fit max-w-full truncate">
+                                        {node.version || "N/A"}
+                                      </span>
+                                    </div>
+                                    <div className="flex items-center justify-between rounded border border-white/5 bg-neutral-900/40 px-2 py-1">
+                                      <span className="text-[9px] text-neutral-500 font-bold uppercase tracking-wider">
+                                        Active Routes
+                                      </span>
+                                      <span className="text-[10px] text-sky-300 font-semibold">
+                                        {outboundRouteCount}
+                                      </span>
+                                    </div>
+                                    {node.id === "service:proxy" &&
+                                      user?.isAdmin && (
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            void openProxyLogs();
+                                          }}
+                                          className={`h-7 w-full rounded border px-2 text-[10px] uppercase tracking-wider font-semibold transition-colors ${
+                                            containerActionLoading[
+                                              "service:proxy"
+                                            ]
+                                              ? "border-neutral-700 text-neutral-500 cursor-not-allowed"
+                                              : "border-neutral-700 text-neutral-300 hover:bg-neutral-800"
+                                          }`}
+                                          disabled={Boolean(
+                                            containerActionLoading[
+                                              "service:proxy"
+                                            ],
+                                          )}
+                                        >
+                                          View Logs
+                                        </button>
+                                      )}
+                                  </div>
+                                ) : node.kind === "internet" ? (
+                                  <div className="space-y-2.5">
+                                    <div className="flex items-center justify-between rounded border border-sky-500/20 bg-sky-500/5 px-2 py-1.5">
+                                      <span className="text-[9px] text-sky-200 font-bold uppercase tracking-wider">
+                                        Public Entry
+                                      </span>
+                                      <span className="text-[10px] text-sky-300 font-semibold">
+                                        Active
+                                      </span>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-1.5">
+                                      <div className="rounded border border-white/5 bg-neutral-900/40 px-2 py-1.5">
+                                        <div className="text-[8px] text-neutral-500 font-bold uppercase tracking-wider">
+                                          Protocol
+                                        </div>
+                                        <div className="text-[10px] text-neutral-200 font-mono">
+                                          HTTP(S)
+                                        </div>
+                                      </div>
+                                      <div className="rounded border border-white/5 bg-neutral-900/40 px-2 py-1.5">
+                                        <div className="text-[8px] text-neutral-500 font-bold uppercase tracking-wider">
+                                          Routed To
+                                        </div>
+                                        <div className="text-[10px] text-neutral-200 font-semibold">
+                                          {outboundRouteCount} Service
+                                          {outboundRouteCount === 1 ? "" : "s"}
+                                        </div>
+                                      </div>
+                                    </div>
+                                    <div className="text-[9px] text-neutral-400 leading-tight">
+                                      External traffic enters here before being
+                                      forwarded to the proxy layer.
+                                    </div>
+                                  </div>
                                 ) : (
                                   node.detail && (
                                     <span className="text-[11px] text-neutral-400 truncate leading-tight">
@@ -1393,25 +1882,214 @@ export default function Containers() {
                               </div>
                               {(isContainer || node.kind === "project") && (
                                 <div
-                                  className={`flex items-center justify-end px-3 h-[40px] border-t ${
+                                  className={`flex items-center justify-end px-3 h-[40px] border-t gap-1 ${
                                     isSelected
                                       ? "border-neutral-600"
                                       : "border-[#2a2a2a]"
                                   }`}
                                 >
-                                  <Button
-                                    size="sm"
-                                    variant="outline"
+                                  {isContainer &&
+                                    containerMatch &&
+                                    !node.isSimulated && (
+                                      <>
+                                        <div
+                                          role="button"
+                                          tabIndex={0}
+                                          onClick={(e) => {
+                                            if (
+                                              node.isSimulated ||
+                                              Boolean(
+                                                containerActionLoading[
+                                                  containerMatch.id
+                                                ],
+                                              )
+                                            ) {
+                                              return;
+                                            }
+                                            e.stopPropagation();
+                                            void openContainerLogs(
+                                              containerMatch,
+                                            );
+                                          }}
+                                          onKeyDown={(e) => {
+                                            if (
+                                              e.key === "Enter" ||
+                                              e.key === " "
+                                            ) {
+                                              e.preventDefault();
+                                              if (
+                                                node.isSimulated ||
+                                                Boolean(
+                                                  containerActionLoading[
+                                                    containerMatch.id
+                                                  ],
+                                                )
+                                              ) {
+                                                return;
+                                              }
+                                              void openContainerLogs(
+                                                containerMatch,
+                                              );
+                                            }
+                                          }}
+                                          className={`h-6 min-w-6 px-2 py-0 border rounded-md flex items-center justify-center text-[10px] border-neutral-700 ${
+                                            node.isSimulated ||
+                                            Boolean(
+                                              containerActionLoading[
+                                                containerMatch.id
+                                              ],
+                                            )
+                                              ? "opacity-40 pointer-events-none"
+                                              : "hover:bg-neutral-800 cursor-pointer"
+                                          }`}
+                                          title="View logs"
+                                        >
+                                          <ListBulletsIcon size={12} />
+                                        </div>
+                                        <div
+                                          role="button"
+                                          tabIndex={0}
+                                          onClick={(e) => {
+                                            if (
+                                              node.isSimulated ||
+                                              Boolean(
+                                                containerActionLoading[
+                                                  containerMatch.id
+                                                ],
+                                              )
+                                            ) {
+                                              return;
+                                            }
+                                            e.stopPropagation();
+                                            void handleContainerAction(
+                                              containerMatch,
+                                              containerMatch.state === "running"
+                                                ? "stop"
+                                                : "start",
+                                            );
+                                          }}
+                                          onKeyDown={(e) => {
+                                            if (
+                                              e.key === "Enter" ||
+                                              e.key === " "
+                                            ) {
+                                              e.preventDefault();
+                                              if (
+                                                node.isSimulated ||
+                                                Boolean(
+                                                  containerActionLoading[
+                                                    containerMatch.id
+                                                  ],
+                                                )
+                                              ) {
+                                                return;
+                                              }
+                                              void handleContainerAction(
+                                                containerMatch,
+                                                containerMatch.state ===
+                                                  "running"
+                                                  ? "stop"
+                                                  : "start",
+                                              );
+                                            }
+                                          }}
+                                          className={`h-6 min-w-6 px-2 py-0 border rounded-md flex items-center justify-center text-[10px] border-neutral-700 ${
+                                            node.isSimulated ||
+                                            Boolean(
+                                              containerActionLoading[
+                                                containerMatch.id
+                                              ],
+                                            )
+                                              ? "opacity-40 pointer-events-none"
+                                              : "hover:bg-neutral-800 cursor-pointer"
+                                          }`}
+                                          title={
+                                            containerMatch.state === "running"
+                                              ? "Stop"
+                                              : "Start"
+                                          }
+                                        >
+                                          {containerMatch.state ===
+                                          "running" ? (
+                                            <StopIcon size={12} />
+                                          ) : (
+                                            <PlayIcon size={12} />
+                                          )}
+                                        </div>
+                                        <div
+                                          role="button"
+                                          tabIndex={0}
+                                          onClick={(e) => {
+                                            if (
+                                              node.isSimulated ||
+                                              Boolean(
+                                                containerActionLoading[
+                                                  containerMatch.id
+                                                ],
+                                              )
+                                            ) {
+                                              return;
+                                            }
+                                            e.stopPropagation();
+                                            void handleContainerAction(
+                                              containerMatch,
+                                              "restart",
+                                            );
+                                          }}
+                                          onKeyDown={(e) => {
+                                            if (
+                                              e.key === "Enter" ||
+                                              e.key === " "
+                                            ) {
+                                              e.preventDefault();
+                                              if (
+                                                node.isSimulated ||
+                                                Boolean(
+                                                  containerActionLoading[
+                                                    containerMatch.id
+                                                  ],
+                                                )
+                                              ) {
+                                                return;
+                                              }
+                                              void handleContainerAction(
+                                                containerMatch,
+                                                "restart",
+                                              );
+                                            }
+                                          }}
+                                          className={`h-6 min-w-6 px-2 py-0 border rounded-md flex items-center justify-center text-[10px] border-neutral-700 ${
+                                            node.isSimulated ||
+                                            Boolean(
+                                              containerActionLoading[
+                                                containerMatch.id
+                                              ],
+                                            )
+                                              ? "opacity-40 pointer-events-none"
+                                              : "hover:bg-neutral-800 cursor-pointer"
+                                          }`}
+                                          title="Restart"
+                                        >
+                                          <ArrowClockwiseIcon size={12} />
+                                        </div>
+                                      </>
+                                    )}
+                                  <div
+                                    role="button"
+                                    tabIndex={0}
                                     onClick={(e) => {
                                       e.stopPropagation();
                                       setSelectedNodeId(node.id); // Also highlight when opening drawer
                                       if (panStateRef.current.moved) return;
-                                      if (isContainer && node.containerId) {
-                                        const match = containers.find(
-                                          (c) => c.id === node.containerId,
-                                        );
-                                        if (match) setSelectedContainer(match);
+                                      if (isContainer && containerMatch) {
+                                        setSelectedContainer(containerMatch);
                                       } else if (node.kind === "project") {
+                                        if (
+                                          node.label.toLowerCase() === "baseful"
+                                        ) {
+                                          setBasefulUsersDrawerOpen(true);
+                                          return;
+                                        }
                                         const p = Object.values(
                                           projectsById,
                                         ).find(
@@ -1423,10 +2101,16 @@ export default function Containers() {
                                         }
                                       }
                                     }}
-                                    className="h-6 text-[10px] px-2 py-0 uppercase tracking-wider font-bold border-neutral-700 hover:bg-neutral-800"
+                                    onKeyDown={(e) => {
+                                      if (e.key === "Enter" || e.key === " ") {
+                                        e.preventDefault();
+                                        setSelectedNodeId(node.id);
+                                      }
+                                    }}
+                                    className="h-6 min-w-6 px-2 py-0 uppercase tracking-wider font-bold border border-neutral-700 rounded-md hover:bg-neutral-800 cursor-pointer flex items-center justify-center text-[10px]"
                                   >
                                     Open
-                                  </Button>
+                                  </div>
                                 </div>
                               )}
                             </div>
@@ -1445,7 +2129,47 @@ export default function Containers() {
                 onProjectUpdated={fetchContainers}
               />
 
-              <div className="absolute top-3 right-3 flex items-center gap-2 text-[11px] text-neutral-300 bg-black/45 border border-white/10 rounded-md px-2 py-1">
+              <Dialog open={logsDialogOpen} onOpenChange={setLogsDialogOpen}>
+                <DialogContent className="sm:max-w-[85vw] w-full h-[75vh] flex flex-col p-0 gap-0 bg-[#0c0c0c] border-neutral-800 text-neutral-200 overflow-hidden">
+                  <DialogHeader className="px-4 py-3 border-b border-neutral-800 bg-neutral-900/50">
+                    <DialogTitle className="text-sm font-medium font-mono text-neutral-300">
+                      Logs: {logsContainerName || "Container"}
+                    </DialogTitle>
+                  </DialogHeader>
+                  <div className="flex-1 overflow-auto p-4 font-mono text-xs whitespace-pre-wrap text-neutral-300">
+                    {logsLoading
+                      ? "Loading logs..."
+                      : logsContent || "No log output."}
+                  </div>
+                </DialogContent>
+              </Dialog>
+
+              <Drawer
+                open={basefulUsersDrawerOpen}
+                onOpenChange={setBasefulUsersDrawerOpen}
+                direction={isMobileDrawer ? "bottom" : "right"}
+              >
+                <DrawerContent
+                  className={
+                    isMobileDrawer
+                      ? "h-[88vh] !max-h-none w-full bg-card border-t border-border rounded-none"
+                      : "h-full !w-[92vw] sm:!w-[820px] sm:!max-w-[820px] !max-w-[92vw] bg-card border-l border-border rounded-none"
+                  }
+                >
+                  <DrawerHeader>
+                    <DrawerTitle>Baseful Users & Whitelist</DrawerTitle>
+                    <DrawerDescription>
+                      Manage signed-up users, project access, permissions, and
+                      whitelist.
+                    </DrawerDescription>
+                  </DrawerHeader>
+                  <div className="flex-1 min-h-0">
+                    <UserManagementPanel showHeader={false} />
+                  </div>
+                </DrawerContent>
+              </Drawer>
+
+              <div className="absolute top-3 right-3 flex items-center gap-2 text-sm text-neutral-300 bg-card border border-white/10 rounded-md pl-2 pr-1 py-1">
                 <span>{Math.round(viewport.scale * 100)}%</span>
                 <Button
                   variant="outline"
@@ -1462,9 +2186,15 @@ export default function Containers() {
                 onOpenChange={(open: boolean) =>
                   !open && setSelectedContainer(null)
                 }
-                direction="right"
+                direction={isMobileDrawer ? "bottom" : "right"}
               >
-                <DrawerContent className="h-full bg-card border-l border-border rounded-none">
+                <DrawerContent
+                  className={
+                    isMobileDrawer
+                      ? "h-[82vh] !max-h-none bg-card border-t border-border rounded-none"
+                      : "h-full bg-card border-l border-border rounded-none"
+                  }
+                >
                   {selectedContainer && (
                     <>
                       <DrawerHeader>
@@ -1475,7 +2205,7 @@ export default function Containers() {
                           {getContainerDisplayNames(selectedContainer).full}
                         </DrawerDescription>
                       </DrawerHeader>
-                      <div className="flex-1 overflow-y-auto space-y-6 p-4">
+                      <div className="flex-1 min-h-0 overflow-y-auto space-y-6 p-4">
                         <div className="space-y-2">
                           <label className="text-xs uppercase tracking-wider text-neutral-500">
                             Image

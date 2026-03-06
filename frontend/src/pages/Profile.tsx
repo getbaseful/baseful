@@ -1,9 +1,9 @@
 import { useState, useRef, useEffect } from "react";
 import { useAuth } from "../context/AuthContext";
 import { authFetch } from "../lib/api";
-import { Facehash } from "facehash";
 import { Camera, Lock, User, At, ArrowLeft, SignOut } from "@phosphor-icons/react";
 import { Link } from "react-router-dom";
+import { LetterAvatar } from "@/components/ui/letter-avatar";
 
 export default function Profile() {
     const { user, token, updateUser, logout } = useAuth();
@@ -214,7 +214,11 @@ export default function Profile() {
                                 ) : user?.avatarUrl ? (
                                     <img src={user.avatarUrl} className="size-full object-cover" alt="" />
                                 ) : (
-                                    <Facehash name={user?.email || ""} size={96} colorClasses={["bg-orange-600", "bg-blue-600", "bg-lime-600", "bg-purple-600"]} />
+                                    <LetterAvatar
+                                        name={user?.email || ""}
+                                        size={96}
+                                        className="rounded-full"
+                                    />
                                 )}
                             </div>
                             <button

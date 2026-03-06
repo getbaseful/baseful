@@ -2,7 +2,6 @@ import {
   CheckIcon,
   CaretDownIcon,
   ClockCounterClockwiseIcon,
-  CubeIcon,
   GearSixIcon,
   Globe,
   GraphIcon,
@@ -16,6 +15,7 @@ import {
   NotePencilIcon,
   BellSimpleIcon,
   SirenIcon,
+  CubeTransparentIcon,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { useAuth } from "@/context/AuthContext";
@@ -25,12 +25,12 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { Facehash } from "facehash";
 import CreateDatabaseDialog from "@/components/database/CreateDatabaseDialog";
 import CreateProjectDialog from "@/components/project/CreateProjectDialog";
 import { useDatabase } from "@/context/DatabaseContext";
 import { useProject } from "@/context/ProjectContext";
 import { DitherAvatar } from "../ui/hash-avatar";
+import { LetterAvatar } from "../ui/letter-avatar";
 
 export default function Sidebar() {
   const { selectedDatabase, setSelectedDatabase, databases, refreshDatabases } =
@@ -500,94 +500,108 @@ export default function Sidebar() {
         )}
 
         {(canAccessServer || canManageNotifications) && (
-        <div>
-          <h2 className="text-xs font-medium text-neutral-400 mb-3 px-2.5">
-            SERVER
-          </h2>
-          <ul className="flex flex-col gap-1">
-            {canAccessServer && <li
-              className={`py-1.5 px-2.5 rounded-md ${
-                location.pathname === "/monitoring" ? "bg-muted/50" : ""
-              }`}
-            >
-              <Link
-                to="/monitoring"
-                className="text-neutral-100 text-sm flex flex-row items-center gap-2"
-              >
-                <GraphIcon
-                  size={18}
-                  weight="bold"
-                  className="text-neutral-400"
-                />
-                <span>Monitoring</span>
-              </Link>
-            </li>}
-            {canAccessServer && <li
-              className={`py-1.5 px-2.5 rounded-md ${
-                location.pathname === "/containers" ? "bg-muted/50" : ""
-              }`}
-            >
-              <Link
-                to="/containers"
-                className="text-neutral-100 text-sm flex flex-row items-center gap-2"
-              >
-                <CubeIcon
-                  size={18}
-                  weight="bold"
-                  className="text-neutral-400"
-                />
-                <span>Containers</span>
-              </Link>
-            </li>}
-            {canAccessServer && <li
-              className={`py-1.5 px-2.5 rounded-md ${
-                location.pathname === "/web-server" ? "bg-muted/50" : ""
-              }`}
-            >
-              <Link
-                to="/web-server"
-                className="text-neutral-100 text-sm flex flex-row items-center gap-2"
-              >
-                <Globe size={18} weight="bold" className="text-neutral-400" />
-                <span>Web Server</span>
-              </Link>
-            </li>}
-            {canManageNotifications && <li
-              className={`py-1.5 px-2.5 rounded-md ${
-                location.pathname === "/notifications" ? "bg-muted/50" : ""
-              }`}
-            >
-              <Link
-                to="/notifications"
-                className="text-neutral-100 text-sm flex flex-row items-center gap-2"
-              >
-                <BellSimpleIcon
-                  size={18}
-                  weight="bold"
-                  className="text-neutral-400"
-                />
-                <span>Notification Center</span>
-              </Link>
-            </li>}
-            {canAccessServer && <li
-              className={`py-1.5 px-2.5 rounded-md ${
-                location.pathname === "/security" ? "bg-muted/50" : ""
-              }`}
-            >
-              <Link
-                to="/security"
-                className="text-neutral-100 text-sm flex flex-row items-center gap-2"
-              >
-                <LockIcon
-                  size={18}
-                  weight="bold"
-                  className="text-neutral-400"
-                />
-                <span>Security</span>
-              </Link>
-            </li>}
-          </ul>
-        </div>
+          <div>
+            <h2 className="text-xs font-medium text-neutral-400 mb-3 px-2.5">
+              SERVER
+            </h2>
+            <ul className="flex flex-col gap-1">
+              {canAccessServer && (
+                <li
+                  className={`py-1.5 px-2.5 rounded-md ${
+                    location.pathname === "/monitoring" ? "bg-muted/50" : ""
+                  }`}
+                >
+                  <Link
+                    to="/monitoring"
+                    className="text-neutral-100 text-sm flex flex-row items-center gap-2"
+                  >
+                    <GraphIcon
+                      size={18}
+                      weight="bold"
+                      className="text-neutral-400"
+                    />
+                    <span>Monitoring</span>
+                  </Link>
+                </li>
+              )}
+              {canAccessServer && (
+                <li
+                  className={`py-1.5 px-2.5 rounded-md ${
+                    location.pathname === "/containers" ? "bg-muted/50" : ""
+                  }`}
+                >
+                  <Link
+                    to="/containers"
+                    className="text-neutral-100 text-sm flex flex-row items-center gap-2"
+                  >
+                    <CubeTransparentIcon
+                      size={18}
+                      weight="bold"
+                      className="text-neutral-400"
+                    />
+                    <span>Topology</span>
+                  </Link>
+                </li>
+              )}
+              {canAccessServer && (
+                <li
+                  className={`py-1.5 px-2.5 rounded-md ${
+                    location.pathname === "/web-server" ? "bg-muted/50" : ""
+                  }`}
+                >
+                  <Link
+                    to="/web-server"
+                    className="text-neutral-100 text-sm flex flex-row items-center gap-2"
+                  >
+                    <Globe
+                      size={18}
+                      weight="bold"
+                      className="text-neutral-400"
+                    />
+                    <span>Web Server</span>
+                  </Link>
+                </li>
+              )}
+              {canManageNotifications && (
+                <li
+                  className={`py-1.5 px-2.5 rounded-md ${
+                    location.pathname === "/notifications" ? "bg-muted/50" : ""
+                  }`}
+                >
+                  <Link
+                    to="/notifications"
+                    className="text-neutral-100 text-sm flex flex-row items-center gap-2"
+                  >
+                    <BellSimpleIcon
+                      size={18}
+                      weight="bold"
+                      className="text-neutral-400"
+                    />
+                    <span>Notification Center</span>
+                  </Link>
+                </li>
+              )}
+              {canAccessServer && (
+                <li
+                  className={`py-1.5 px-2.5 rounded-md ${
+                    location.pathname === "/security" ? "bg-muted/50" : ""
+                  }`}
+                >
+                  <Link
+                    to="/security"
+                    className="text-neutral-100 text-sm flex flex-row items-center gap-2"
+                  >
+                    <LockIcon
+                      size={18}
+                      weight="bold"
+                      className="text-neutral-400"
+                    />
+                    <span>Security</span>
+                  </Link>
+                </li>
+              )}
+            </ul>
+          </div>
         )}
 
         {user?.isAdmin && (
@@ -624,25 +638,19 @@ export default function Sidebar() {
           <div className="px-2 py-3 mt-4 flex flex-col gap-2">
             <Link
               to="/settings/profile"
-              className="flex items-center gap-3 hover:bg-muted/30 p-1 -m-1 rounded-md transition-colors"
+              className="flex items-center gap-3 hover:bg-muted/30 p-1 -m-1 rounded-full transition-colors"
             >
               {user.avatarUrl ? (
                 <img
                   src={user.avatarUrl}
-                  className="size-8 rounded-sm object-cover bg-muted"
+                  className="size-8 rounded-full object-cover bg-muted"
                   alt=""
                 />
               ) : (
-                <Facehash
+                <LetterAvatar
                   name={user.email}
                   size={32}
-                  colorClasses={[
-                    "bg-orange-600",
-                    "bg-blue-600",
-                    "bg-lime-600",
-                    "bg-purple-600",
-                  ]}
-                  className="rounded-sm"
+                  className="rounded-full"
                 />
               )}
               <div className="flex flex-col min-w-0">

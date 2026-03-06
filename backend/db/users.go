@@ -100,7 +100,7 @@ func GetUserByID(id int) (*User, error) {
 // GetAllUsers returns all users without sensitive fields
 func GetAllUsers() ([]UserSummary, error) {
 	rows, err := DB.Query(
-		"SELECT id, email, COALESCE(first_name, ''), COALESCE(last_name, ''), is_admin FROM users ORDER BY created_at DESC",
+		"SELECT id, email, COALESCE(first_name, ''), COALESCE(last_name, ''), is_admin, COALESCE(avatar_url, '') FROM users ORDER BY created_at DESC",
 	)
 	if err != nil {
 		return nil, err
@@ -110,7 +110,7 @@ func GetAllUsers() ([]UserSummary, error) {
 	users := []UserSummary{}
 	for rows.Next() {
 		var user UserSummary
-		if err := rows.Scan(&user.ID, &user.Email, &user.FirstName, &user.LastName, &user.IsAdmin); err != nil {
+		if err := rows.Scan(&user.ID, &user.Email, &user.FirstName, &user.LastName, &user.IsAdmin, &user.AvatarURL); err != nil {
 			return nil, err
 		}
 		users = append(users, user)

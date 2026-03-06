@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -14,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +40,13 @@ import (
 const (
 	sessionCookieName      = "baseful_session"
 	sessionCookieMaxAgeSec = 7 * 24 * 60 * 60
+	defaultProxyLogTail    = 200
+	maxProxyLogTail        = 1000
+)
+
+var (
+	proxyLogTokenFieldRe    = regexp.MustCompile(`("token_id"\s*:\s*")[^"]*(")`)
+	proxyLogConnStringToken = regexp.MustCompile(`(postgres(?:ql)?://[^:\s]+:)[^@\s]+(@)`)
 )
 
 func getFreePort() (int, error) {
@@ -92,6 +101,43 @@ func sanitizeSQLResponse(raw string) string {
 		sqlText = strings.TrimSpace(sqlText[4:])
 	}
 	return sqlText
+}
+
+func sanitizeProxyLogLine(line string) string {
+	sanitized := proxyLogTokenFieldRe.ReplaceAllString(line, `${1}***REDACTED***${2}`)
+	sanitized = proxyLogConnStringToken.ReplaceAllString(sanitized, `${1}***REDACTED***${2}`)
+	return sanitized
+}
+
+func readProxyLogTail(logPath string, tail int) ([]string, error) {
+	file, err := os.Open(logPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+	defer file.Close()
+
+	lines := make([]string, 0, tail)
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+
+	for scanner.Scan() {
+		line := sanitizeProxyLogLine(scanner.Text())
+		if len(lines) < tail {
+			lines = append(lines, line)
+			continue
+		}
+		copy(lines, lines[1:])
+		lines[tail-1] = line
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return lines, nil
 }
 
 func isSecureRequest(c *gin.Context) bool {
@@ -4162,6 +4208,37 @@ func main() {
 		c.JSON(200, containers)
 	})
 
+	canAccessContainer := func(c *gin.Context, containerID string) (bool, string) {
+		isAdmin := c.MustGet("is_admin").(bool)
+		if isAdmin {
+			return true, ""
+		}
+
+		containers, err := docker.ListContainers()
+		if err != nil {
+			return false, "Failed to inspect container"
+		}
+
+		var projectID string
+		for _, ctr := range containers {
+			if ctr.ID == containerID {
+				projectID = ctr.Labels["baseful.project_id"]
+				break
+			}
+		}
+		if projectID == "" {
+			return false, "Access denied: container has no associated project"
+		}
+
+		pid, _ := strconv.Atoi(projectID)
+		userID := c.MustGet("user_id").(int)
+		canAccess, err := db.UserCanAccessProject(userID, pid)
+		if err != nil || !canAccess {
+			return false, "Access denied: insufficient project permissions"
+		}
+		return true, ""
+	}
+
 	// Execute command in container
 	r.POST("/api/docker/containers/:id/exec", func(c *gin.Context) {
 		if !requirePermission(c, db.PermissionServerAccess) {
@@ -4169,33 +4246,13 @@ func main() {
 		}
 		id := c.Param("id")
 
-		// For non-admins, verify they have access to the container's project
-		isAdmin := c.MustGet("is_admin").(bool)
-		if !isAdmin {
-			// Look up the container's project label
-			containers, err := docker.ListContainers()
-			if err != nil {
-				c.JSON(500, gin.H{"error": "Failed to inspect container"})
-				return
+		if ok, msg := canAccessContainer(c, id); !ok {
+			if strings.HasPrefix(msg, "Failed") {
+				c.JSON(500, gin.H{"error": msg})
+			} else {
+				c.JSON(403, gin.H{"error": msg})
 			}
-			var projectID string
-			for _, ctr := range containers {
-				if ctr.ID == id {
-					projectID = ctr.Labels["baseful.project_id"]
-					break
-				}
-			}
-			if projectID == "" {
-				c.JSON(403, gin.H{"error": "Access denied: container has no associated project"})
-				return
-			}
-			pid, _ := strconv.Atoi(projectID)
-			userID := c.MustGet("user_id").(int)
-			canAccess, err := db.UserCanAccessProject(userID, pid)
-			if err != nil || !canAccess {
-				c.JSON(403, gin.H{"error": "Access denied: insufficient project permissions"})
-				return
-			}
+			return
 		}
 
 		var req struct {
@@ -4219,6 +4276,92 @@ func main() {
 		}
 
 		c.JSON(200, result)
+	})
+
+	// Start container
+	r.POST("/api/docker/containers/:id/start", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
+		id := c.Param("id")
+		if ok, msg := canAccessContainer(c, id); !ok {
+			if strings.HasPrefix(msg, "Failed") {
+				c.JSON(500, gin.H{"error": msg})
+			} else {
+				c.JSON(403, gin.H{"error": msg})
+			}
+			return
+		}
+		if err := docker.StartContainer(id); err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(200, gin.H{"message": "Container started"})
+	})
+
+	// Stop container
+	r.POST("/api/docker/containers/:id/stop", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
+		id := c.Param("id")
+		if ok, msg := canAccessContainer(c, id); !ok {
+			if strings.HasPrefix(msg, "Failed") {
+				c.JSON(500, gin.H{"error": msg})
+			} else {
+				c.JSON(403, gin.H{"error": msg})
+			}
+			return
+		}
+		if err := docker.StopContainer(id); err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(200, gin.H{"message": "Container stopped"})
+	})
+
+	// Restart container
+	r.POST("/api/docker/containers/:id/restart", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
+		id := c.Param("id")
+		if ok, msg := canAccessContainer(c, id); !ok {
+			if strings.HasPrefix(msg, "Failed") {
+				c.JSON(500, gin.H{"error": msg})
+			} else {
+				c.JSON(403, gin.H{"error": msg})
+			}
+			return
+		}
+		if err := docker.RestartContainer(id); err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(200, gin.H{"message": "Container restarted"})
+	})
+
+	// Container logs
+	r.GET("/api/docker/containers/:id/logs", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
+		id := c.Param("id")
+		if ok, msg := canAccessContainer(c, id); !ok {
+			if strings.HasPrefix(msg, "Failed") {
+				c.JSON(500, gin.H{"error": msg})
+			} else {
+				c.JSON(403, gin.H{"error": msg})
+			}
+			return
+		}
+
+		logs, err := docker.GetContainerLogs(id, c.DefaultQuery("tail", "200"))
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(200, gin.H{"logs": logs})
 	})
 
 	// ========== DOCKER NETWORK STATUS ==========
@@ -4266,6 +4409,57 @@ func main() {
 			"running": true,
 			"port":    auth.GetProxyPort(),
 			"host":    auth.GetProxyHost(),
+		})
+	})
+
+	// Get Proxy logs
+	r.GET("/api/docker/proxy/logs", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
+		if !c.MustGet("is_admin").(bool) {
+			c.JSON(403, gin.H{"error": "Access denied: admin privileges required"})
+			return
+		}
+
+		tail := defaultProxyLogTail
+		if rawTail := strings.TrimSpace(c.DefaultQuery("tail", strconv.Itoa(defaultProxyLogTail))); rawTail != "" {
+			parsed, err := strconv.Atoi(rawTail)
+			if err != nil || parsed <= 0 {
+				c.JSON(400, gin.H{"error": "Invalid tail value"})
+				return
+			}
+			if parsed > maxProxyLogTail {
+				parsed = maxProxyLogTail
+			}
+			tail = parsed
+		}
+
+		logPath := strings.TrimSpace(os.Getenv("PROXY_LOG_PATH"))
+		if logPath != "" {
+			lines, err := readProxyLogTail(logPath, tail)
+			if err != nil {
+				c.JSON(500, gin.H{"error": "Failed to read proxy logs"})
+				return
+			}
+			c.JSON(200, gin.H{
+				"logs":   strings.Join(lines, "\n"),
+				"source": "file",
+				"tail":   tail,
+			})
+			return
+		}
+
+		entries := proxy.GetLogger().GetRecentEntries(tail)
+		payload, err := json.MarshalIndent(entries, "", "  ")
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to encode proxy logs"})
+			return
+		}
+		c.JSON(200, gin.H{
+			"logs":   sanitizeProxyLogLine(string(payload)),
+			"source": "memory",
+			"tail":   tail,
 		})
 	})
 

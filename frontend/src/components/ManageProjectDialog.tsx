@@ -10,7 +10,7 @@ import { Input } from "@/components/ui/input";
 import { useAuth } from "@/context/AuthContext";
 import { authFetch } from "@/lib/api";
 import { toast } from "sonner";
-import { FacehashSVG } from "@/components/FacehashSVG";
+import { LetterAvatar } from "@/components/ui/letter-avatar";
 
 interface User {
     id: number;
@@ -41,6 +41,17 @@ export function ManageProjectDialog({
     const [projectMembers, setProjectMembers] = useState<User[]>([]); // full objects for read-only view
     const [allUsers, setAllUsers] = useState<User[]>([]);
     const [loadingUsers, setLoadingUsers] = useState(false);
+    const [isMobileDrawer, setIsMobileDrawer] = useState(false);
+
+    useEffect(() => {
+        const updateMobileDrawer = () => {
+            if (typeof window === "undefined") return;
+            setIsMobileDrawer(window.innerWidth < 768);
+        };
+        updateMobileDrawer();
+        window.addEventListener("resize", updateMobileDrawer);
+        return () => window.removeEventListener("resize", updateMobileDrawer);
+    }, []);
 
     useEffect(() => {
         if (project) {
@@ -139,12 +150,22 @@ export function ManageProjectDialog({
     if (!project) return null;
 
     return (
-        <Drawer open={open} onOpenChange={onOpenChange} direction="right">
-            <DrawerContent className="h-full bg-card border-l border-border rounded-none">
+        <Drawer
+            open={open}
+            onOpenChange={onOpenChange}
+            direction={isMobileDrawer ? "bottom" : "right"}
+        >
+            <DrawerContent
+                className={
+                    isMobileDrawer
+                        ? "h-[88vh] !max-h-none w-full bg-card border-t border-border rounded-none"
+                        : "h-full bg-card border-l border-border rounded-none"
+                }
+            >
                 <DrawerHeader>
                     <DrawerTitle>{project.name}</DrawerTitle>
                 </DrawerHeader>
-                <div className="flex-1 overflow-y-auto space-y-6 p-4">
+                <div className="flex-1 min-h-0 overflow-y-auto space-y-6 p-4">
                     {canEditProject && (
                         <div className="space-y-2">
                             <label className="text-xs uppercase tracking-wider text-neutral-500">
@@ -186,7 +207,7 @@ export function ManageProjectDialog({
                                                     {u.avatarUrl ? (
                                                         <img src={u.avatarUrl} className="size-full object-cover" alt="" />
                                                     ) : (
-                                                        <FacehashSVG
+                                                        <LetterAvatar
                                                             name={u.email}
                                                             size={24}
                                                         />
@@ -216,7 +237,7 @@ export function ManageProjectDialog({
                                                 {u.avatarUrl ? (
                                                     <img src={u.avatarUrl} className="size-full object-cover" alt="" />
                                                 ) : (
-                                                    <FacehashSVG
+                                                    <LetterAvatar
                                                         name={u.email}
                                                         size={24}
                                                     />

@@ -30,6 +30,8 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { DitherAvatar } from "@/components/ui/hash-avatar";
 import { useAuth } from "@/context/AuthContext";
 import { authFetch } from "@/lib/api";
+import { toast } from "sonner";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 
 interface Database {
   id: number;
@@ -224,6 +226,8 @@ export default function DatabaseDetail() {
   const [connectionLoading, setConnectionLoading] = useState(false);
   const [rotatingToken, setRotatingToken] = useState(false);
   const [useDomain, setUseDomain] = useState(false);
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  const [confirmRotateTokenOpen, setConfirmRotateTokenOpen] = useState(false);
 
   const currentHostname = window.location.hostname;
   const isIP = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(currentHostname);
@@ -250,15 +254,6 @@ export default function DatabaseDetail() {
   }, [connectionString, useDomain, currentHostname, isIP, isLocal]);
 
   const handleAction = async (action: string) => {
-    if (
-      action === "delete" &&
-      !confirm(
-        "Are you sure you want to delete this database? This will remove the container and all data.",
-      )
-    ) {
-      return;
-    }
-
     setActionLoading(action);
     try {
       const res = await authFetch(
@@ -283,7 +278,7 @@ export default function DatabaseDetail() {
       refetchDatabase();
       refreshDatabases();
     } catch (err: unknown) {
-      alert(err instanceof Error ? err.message : "An error occurred");
+      toast.error(err instanceof Error ? err.message : "An error occurred");
     } finally {
       setActionLoading(null);
     }
@@ -323,14 +318,6 @@ export default function DatabaseDetail() {
   };
 
   const rotateConnectionToken = async () => {
-    if (
-      !confirm(
-        "Rotate access token? Existing connection strings will stop working immediately.",
-      )
-    ) {
-      return;
-    }
-
     setRotatingToken(true);
     try {
       const res = await authFetch(
@@ -350,7 +337,7 @@ export default function DatabaseDetail() {
         "Token rotated. Previous connection strings were revoked immediately.",
       );
     } catch (err: unknown) {
-      alert(err instanceof Error ? err.message : "Failed to rotate token");
+      toast.error(err instanceof Error ? err.message : "Failed to rotate token");
     } finally {
       setRotatingToken(false);
     }
@@ -510,7 +497,7 @@ export default function DatabaseDetail() {
                     {actionLoading === "vacuum" ? "Vacuuming..." : "Vacuum"}
                   </Button>
                   <Button
-                    onClick={() => handleAction("delete")}
+                    onClick={() => setConfirmDeleteOpen(true)}
                     className="cursor-pointer"
                     variant={"destructive"}
                     disabled={actionLoading !== null}
@@ -603,7 +590,7 @@ export default function DatabaseDetail() {
                               className={`h-6 rounded-none px-2 text-xs ${
                                 tokenExpiryInfo ? "border-l border-border" : ""
                               }`}
-                              onClick={rotateConnectionToken}
+                              onClick={() => setConfirmRotateTokenOpen(true)}
                               disabled={rotatingToken || connectionLoading}
                             >
                               {rotatingToken ? "..." : "Rotate"}
@@ -654,10 +641,36 @@ export default function DatabaseDetail() {
                 </div>
               </DialogContent>
             </Dialog>
-          </div>
         </div>
+      </div>
+      <ConfirmDialog
+        open={confirmDeleteOpen}
+        onOpenChange={setConfirmDeleteOpen}
+        title="Delete Database?"
+        description="Are you sure you want to delete this database? This will remove the container and all data."
+        confirmText="Delete"
+        confirmVariant="destructive"
+        loading={actionLoading === "delete"}
+        onConfirm={async () => {
+          await handleAction("delete");
+          setConfirmDeleteOpen(false);
+        }}
+      />
+      <ConfirmDialog
+        open={confirmRotateTokenOpen}
+        onOpenChange={setConfirmRotateTokenOpen}
+        title="Rotate Access Token?"
+        description="Existing connection strings will stop working immediately."
+        confirmText="Rotate"
+        confirmVariant="destructive"
+        loading={rotatingToken}
+        onConfirm={async () => {
+          await rotateConnectionToken();
+          setConfirmRotateTokenOpen(false);
+        }}
+      />
 
-        <div className="p-6 md:p-12 pb-4 md:pb-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 w-full">
+      <div className="p-6 md:p-12 pb-4 md:pb-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 w-full">
           <div className="bg-card border border-border rounded-lg">
             <div className="flex flex-row items-center gap-3 px-2 py-1 w-full border-b border-border">
               <span className="text-sm font-medium text-neutral-300">CPU</span>

@@ -13,6 +13,8 @@ import { Button } from "@/components/ui/button";
 import { DitherAvatar } from "@/components/ui/hash-avatar";
 import { useAuth } from "@/context/AuthContext";
 import { authFetch } from "@/lib/api";
+import { toast } from "sonner";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 
 interface Connection {
   pid: number;
@@ -51,6 +53,9 @@ export default function DatabaseConnections() {
   const [connections, setConnections] = useState<Connection[]>([]);
   const [loading, setLoading] = useState(true);
   const [terminatingPid, setTerminatingPid] = useState<number | null>(null);
+  const [confirmTerminatePid, setConfirmTerminatePid] = useState<number | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
 
   const fetchDatabase = useCallback(async () => {
@@ -79,11 +84,6 @@ export default function DatabaseConnections() {
   }, [id, token, logout]);
 
   const terminateConnection = async (pid: number) => {
-    if (
-      !window.confirm(`Are you sure you want to terminate connection ${pid}?`)
-    )
-      return;
-
     setTerminatingPid(pid);
     try {
       const res = await authFetch(
@@ -98,13 +98,14 @@ export default function DatabaseConnections() {
         fetchConnections();
       } else {
         const data = await res.json();
-        alert(data.error || "Failed to terminate connection");
+        toast.error(data.error || "Failed to terminate connection");
       }
     } catch (err) {
       console.error("Failed to terminate connection:", err);
-      alert("An error occurred while terminating the connection");
+      toast.error("An error occurred while terminating the connection");
     } finally {
       setTerminatingPid(null);
+      setConfirmTerminatePid(null);
     }
   };
 
@@ -284,7 +285,7 @@ export default function DatabaseConnections() {
                               variant="ghost"
                               size="sm"
                               className="h-8 w-8 p-0 text-red-400 hover:text-red-300 hover:bg-red-400/10"
-                              onClick={() => terminateConnection(conn.pid)}
+                              onClick={() => setConfirmTerminatePid(conn.pid)}
                               disabled={terminatingPid === conn.pid}
                               title="Terminate Connection"
                             >
@@ -305,6 +306,21 @@ export default function DatabaseConnections() {
           </div>
         </div>
       </div>
+      <ConfirmDialog
+        open={confirmTerminatePid !== null}
+        onOpenChange={(open) => {
+          if (!open) setConfirmTerminatePid(null);
+        }}
+        title="Terminate Connection?"
+        description={`Are you sure you want to terminate connection ${confirmTerminatePid ?? ""}?`}
+        confirmText="Terminate"
+        confirmVariant="destructive"
+        loading={terminatingPid !== null}
+        onConfirm={async () => {
+          if (confirmTerminatePid === null) return;
+          await terminateConnection(confirmTerminatePid);
+        }}
+      />
     </div>
   );
 }

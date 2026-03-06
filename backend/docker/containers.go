@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -149,4 +150,90 @@ func ExecCommand(containerID string, rawCommand string, currentCwd string) (Exec
 	}
 
 	return ExecResult{Output: finalStdout + finalStderr, Cwd: currentCwd}, nil
+}
+
+func StartContainer(containerID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return fmt.Errorf("failed to create docker client: %w", err)
+	}
+	defer cli.Close()
+
+	if err := cli.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
+		return fmt.Errorf("failed to start container: %w", err)
+	}
+	return nil
+}
+
+func StopContainer(containerID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return fmt.Errorf("failed to create docker client: %w", err)
+	}
+	defer cli.Close()
+
+	timeout := 10
+	if err := cli.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &timeout}); err != nil {
+		return fmt.Errorf("failed to stop container: %w", err)
+	}
+	return nil
+}
+
+func RestartContainer(containerID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return fmt.Errorf("failed to create docker client: %w", err)
+	}
+	defer cli.Close()
+
+	timeout := 10
+	if err := cli.ContainerRestart(ctx, containerID, container.StopOptions{Timeout: &timeout}); err != nil {
+		return fmt.Errorf("failed to restart container: %w", err)
+	}
+	return nil
+}
+
+func GetContainerLogs(containerID string, tail string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return "", fmt.Errorf("failed to create docker client: %w", err)
+	}
+	defer cli.Close()
+
+	if strings.TrimSpace(tail) == "" {
+		tail = "200"
+	}
+
+	reader, err := cli.ContainerLogs(ctx, containerID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Timestamps: true,
+		Tail:       tail,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to get logs: %w", err)
+	}
+	defer reader.Close()
+
+	var outBuf, errBuf strings.Builder
+	if _, err := stdcopy.StdCopy(&outBuf, &errBuf, reader); err != nil {
+		// Fallback: some daemons may return non-multiplexed logs in edge cases.
+		if _, copyErr := io.Copy(&outBuf, reader); copyErr != nil {
+			return "", fmt.Errorf("failed to read logs: %w", err)
+		}
+	}
+
+	return outBuf.String() + errBuf.String(), nil
 }

@@ -40,6 +40,7 @@ import { useDatabase } from "@/context/DatabaseContext";
 import { DitherAvatar } from "@/components/ui/hash-avatar";
 import { useAuth } from "@/context/AuthContext";
 import { authFetch } from "@/lib/api";
+import { toast } from "sonner";
 
 interface BackupSettings {
   database_id: number;
@@ -144,10 +145,12 @@ export default function Backup() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["backupSettings", id] });
-      alert("Settings saved successfully");
+      toast.success("Settings saved successfully");
     },
     onError: (err) => {
-      alert("Failed to save settings: " + err.message);
+      const message =
+        err instanceof Error ? err.message : "Failed to save settings";
+      toast.error(`Failed to save settings: ${message}`);
     },
   });
 
@@ -166,10 +169,12 @@ export default function Backup() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["backups", id] });
-      alert("Backup started");
+      toast.success("Backup started");
     },
     onError: (err) => {
-      alert("Failed to start backup: " + err.message);
+      const message =
+        err instanceof Error ? err.message : "Failed to start backup";
+      toast.error(`Failed to start backup: ${message}`);
     },
   });
 
@@ -219,13 +224,15 @@ export default function Backup() {
     },
     onSuccess: () => {
       setBackupToRollback(null);
-      alert(
+      toast.success(
         "Restore started. Database will be unavailable during restoration.",
       );
     },
     onError: (err) => {
       setBackupToRollback(null);
-      alert("Failed to start restore: " + err.message);
+      const message =
+        err instanceof Error ? err.message : "Failed to start restore";
+      toast.error(`Failed to start restore: ${message}`);
     },
   });
 
@@ -259,12 +266,14 @@ export default function Backup() {
       return res.json();
     },
     onSuccess: () => {
-      alert(
+      toast.success(
         "Restore started. Database will be unavailable during restoration.",
       );
     },
     onError: (err) => {
-      alert("Failed to start restore: " + err.message);
+      const message =
+        err instanceof Error ? err.message : "Failed to start restore";
+      toast.error(`Failed to start restore: ${message}`);
     },
   });
 
@@ -285,12 +294,14 @@ export default function Backup() {
     },
     onSuccess: () => {
       setConnectionString("");
-      alert(
+      toast.success(
         "Restore started. Database will be unavailable during restoration.",
       );
     },
     onError: (err) => {
-      alert("Failed to start restore: " + err.message);
+      const message =
+        err instanceof Error ? err.message : "Failed to start restore";
+      toast.error(`Failed to start restore: ${message}`);
     },
   });
 
@@ -306,7 +317,7 @@ export default function Backup() {
       settingsForm.encryption_enabled &&
       !settingsForm.encryption_public_key.trim()
     ) {
-      alert("Encryption is enabled, but no public key is configured.");
+      toast.error("Encryption is enabled, but no public key is configured.");
       return;
     }
     saveSettingsMutation.mutate(settingsForm);
@@ -325,7 +336,7 @@ export default function Backup() {
 
   const handleDecryptAction = async () => {
     if (!id || !targetBackup || !privateKeyInput.trim()) {
-      alert("Private key is required.");
+      toast.error("Private key is required.");
       return;
     }
 
@@ -382,7 +393,7 @@ export default function Backup() {
           const err = await res.json().catch(() => ({}));
           throw new Error(err.error || "Failed to start restore");
         }
-        alert(
+        toast.success(
           "Restore started. Database will be unavailable during restoration.",
         );
       }
@@ -392,7 +403,7 @@ export default function Backup() {
       setPassphraseInput("");
       setTargetBackup(null);
     } catch (err: unknown) {
-      alert(err instanceof Error ? err.message : "Operation failed");
+      toast.error(err instanceof Error ? err.message : "Operation failed");
     } finally {
       setDecryptLoading(false);
     }

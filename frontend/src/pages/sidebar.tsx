@@ -21,11 +21,11 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { Facehash } from "facehash";
 import CreateDatabaseDialog from "@/components/database/CreateDatabaseDialog";
 import CreateProjectDialog from "@/components/project/CreateProjectDialog";
 import { useDatabase } from "@/context/DatabaseContext";
 import { useProject } from "@/context/ProjectContext";
+import { LetterAvatar } from "@/components/ui/letter-avatar";
 
 export default function Sidebar() {
   const { selectedDatabase, setSelectedDatabase, databases, refreshDatabases } =
@@ -84,23 +84,10 @@ export default function Sidebar() {
         <Popover open={selectorOpen} onOpenChange={setSelectorOpen}>
           <PopoverTrigger asChild>
             <div className="flex flex-row items-center gap-2 cursor-pointer p-2.5 rounded-md hover:bg-accent transition-colors">
-              <Facehash
+              <LetterAvatar
                 name={selectedDatabase?.name || "database"}
-                className="rounded-sm"
-                colorClasses={[
-                  "bg-blue-500",
-                  "bg-orange-500",
-                  "bg-purple-500",
-                  "bg-lime-500",
-                  "bg-indigo-500",
-                  "bg-pink-500",
-                  "bg-teal-500",
-                  "bg-yellow-500",
-                  "bg-sky-500",
-                  "bg-fuchsia-500",
-                  "bg-rose-500",
-                ]}
                 size={22}
+                className="rounded-sm"
               />
               <div className="flex flex-col">
                 <h2 className="text-sm font-medium">
@@ -141,23 +128,10 @@ export default function Sidebar() {
                                 : "hover:bg-accent"
                             }`}
                           >
-                            <Facehash
+                            <LetterAvatar
                               name={db.name}
-                              className="rounded-sm"
-                              colorClasses={[
-                                "bg-blue-500",
-                                "bg-orange-500",
-                                "bg-purple-500",
-                                "bg-lime-500",
-                                "bg-indigo-500",
-                                "bg-pink-500",
-                                "bg-teal-500",
-                                "bg-yellow-500",
-                                "bg-sky-500",
-                                "bg-fuchsia-500",
-                                "bg-rose-500",
-                              ]}
                               size={20}
+                              className="rounded-sm"
                             />
                             <span className="text-sm text-neutral-200">
                               {db.name}

@@ -17,9 +17,11 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import { Facehash } from "facehash";
 import { useAuth } from "@/context/AuthContext";
 import { authFetch } from "@/lib/api";
+import { LetterAvatar } from "@/components/ui/letter-avatar";
+import { toast } from "sonner";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 
 interface Branch {
   id: number;
@@ -42,6 +44,9 @@ export default function Branches() {
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [newBranchName, setNewBranchName] = useState("");
   const [createLoading, setCreateLoading] = useState(false);
+  const [confirmDeleteBranchId, setConfirmDeleteBranchId] = useState<
+    number | null
+  >(null);
 
   const fetchBranches = async () => {
     if (!id || !token) return;
@@ -68,15 +73,6 @@ export default function Branches() {
   }, [id]);
 
   const handleBranchAction = async (branchId: number, action: string) => {
-    if (
-      action === "delete" &&
-      !confirm(
-        "Are you sure you want to delete this branch? This will remove the container and all data.",
-      )
-    ) {
-      return;
-    }
-
     setActionLoading(`${branchId}-${action}`);
     try {
       const res = await authFetch(
@@ -91,7 +87,7 @@ export default function Branches() {
 
       await fetchBranches();
     } catch (err: unknown) {
-      alert(err instanceof Error ? err.message : "An error occurred");
+      toast.error(err instanceof Error ? err.message : "An error occurred");
     } finally {
       setActionLoading(null);
     }
@@ -120,7 +116,7 @@ export default function Branches() {
       setCreateDialogOpen(false);
       await fetchBranches();
     } catch (err: unknown) {
-      alert(err instanceof Error ? err.message : "An error occurred");
+      toast.error(err instanceof Error ? err.message : "An error occurred");
     } finally {
       setCreateLoading(false);
     }
@@ -306,24 +302,10 @@ export default function Branches() {
                 >
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-4">
-                      <Facehash
+                      <LetterAvatar
                         name={branch.name}
-                        className="rounded-sm"
-                        colorClasses={[
-                          "bg-blue-500",
-                          "bg-orange-500",
-                          "bg-purple-500",
-                          "bg-lime-500",
-                          "bg-indigo-500",
-                          "bg-pink-500",
-                          "bg-teal-500",
-                          "bg-yellow-500",
-                          "bg-sky-500",
-                          "bg-fuchsia-500",
-                          "bg-rose-500",
-                          "bg-green-500",
-                        ]}
                         size={40}
+                        className="rounded-sm"
                       />
                       <div>
                         <div className="flex items-center gap-2">
@@ -399,9 +381,7 @@ export default function Branches() {
                         <Button
                           size="sm"
                           variant="destructive"
-                          onClick={() =>
-                            handleBranchAction(branch.id, "delete")
-                          }
+                          onClick={() => setConfirmDeleteBranchId(branch.id)}
                           disabled={actionLoading !== null || branch.is_default}
                           title="Delete branch"
                         >
@@ -416,6 +396,22 @@ export default function Branches() {
           )}
         </div>
       </div>
+      <ConfirmDialog
+        open={confirmDeleteBranchId !== null}
+        onOpenChange={(open) => {
+          if (!open) setConfirmDeleteBranchId(null);
+        }}
+        title="Delete Branch?"
+        description="Are you sure you want to delete this branch? This will remove the container and all data."
+        confirmText="Delete"
+        confirmVariant="destructive"
+        loading={Boolean(actionLoading && actionLoading.endsWith("-delete"))}
+        onConfirm={async () => {
+          if (confirmDeleteBranchId === null) return;
+          await handleBranchAction(confirmDeleteBranchId, "delete");
+          setConfirmDeleteBranchId(null);
+        }}
+      />
     </div>
   );
 }
