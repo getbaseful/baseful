@@ -11,6 +11,9 @@ backend/*.db-wal
 backend/metrics.db
 backend/metrics.db-shm
 
+# Backend data
+backend-data/*
+
 # OS generated files
 .DS_Store
 .DS_Store?
