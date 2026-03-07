@@ -57,7 +57,7 @@ function App() {
                         </div>
 
                         <main className="p-0 md:p-2 bg-background flex h-full flex-1 min-w-0">
-                          <div className="bg-card/75 overflow-y-auto overflow-x-hidden md:border border-border md:rounded-md h-full w-full">
+                          <div className="bg-card overflow-y-auto overflow-x-hidden md:border border-border md:rounded-md h-full w-full">
                             <Routes>
                               <Route path="/" element={<Home />} />
                               <Route path="/about" element={<About />} />
@@ -85,7 +85,10 @@ function App() {
                                 path="/db/:id/monitoring"
                                 element={<Monitoring />}
                               />
-                              <Route path="/monitoring" element={<Monitoring />} />
+                              <Route
+                                path="/monitoring"
+                                element={<Monitoring />}
+                              />
                               <Route
                                 path="/db/:id/sql-editor"
                                 element={<SQLEditor />}
@@ -94,17 +97,26 @@ function App() {
                                 path="/db/:id/connections"
                                 element={<DatabaseConnections />}
                               />
-                              <Route path="/db/:id/tables" element={<Tables />} />
+                              <Route
+                                path="/db/:id/tables"
+                                element={<Tables />}
+                              />
                               <Route
                                 path="/db/:id/containers"
                                 element={<Containers />}
                               />
-                              <Route path="/containers" element={<Containers />} />
+                              <Route
+                                path="/containers"
+                                element={<Containers />}
+                              />
                               <Route
                                 path="/db/:id/web-server"
                                 element={<WebServer />}
                               />
-                              <Route path="/web-server" element={<WebServer />} />
+                              <Route
+                                path="/web-server"
+                                element={<WebServer />}
+                              />
                               <Route
                                 path="/db/:id/notifications"
                                 element={<DatabaseNotifications />}
@@ -123,7 +135,10 @@ function App() {
                               />
                               <Route path="/security" element={<Security />} />
                               <Route path="/users" element={<Users />} />
-                              <Route path="/settings/profile" element={<Profile />} />
+                              <Route
+                                path="/settings/profile"
+                                element={<Profile />}
+                              />
                             </Routes>
                           </div>
                         </main>

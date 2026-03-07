@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useParams, Link } from "react-router-dom";
 import {
   TableIcon,
@@ -82,6 +82,8 @@ export default function Tables() {
   const [totalRows, setTotalRows] = useState(0);
   const [relationSubview, setRelationSubview] =
     useState<RelationSubview | null>(null);
+  const [isMobilePagerVisible, setIsMobilePagerVisible] = useState(true);
+  const lastScrollY = useRef(0);
 
   // Search filter state
   const [filterCol, setFilterCol] = useState<string>("");
@@ -163,6 +165,33 @@ export default function Tables() {
       setLoading(false);
     }
   }, [id, selectedDatabase]);
+
+  useEffect(() => {
+    const handleScroll = (e: Event) => {
+      const target = e.target as HTMLElement;
+      if (!target || typeof target.scrollTop === "undefined") return;
+
+      const currentScrollY = target.scrollTop;
+      const scrollDifference = currentScrollY - lastScrollY.current;
+
+      if (scrollDifference > 10 && currentScrollY > 20) {
+        setIsMobilePagerVisible(false);
+      } else if (scrollDifference < -10 || currentScrollY < 20) {
+        setIsMobilePagerVisible(true);
+      }
+
+      lastScrollY.current = currentScrollY;
+    };
+
+    window.addEventListener("scroll", handleScroll, {
+      capture: true,
+      passive: true,
+    });
+
+    return () => {
+      window.removeEventListener("scroll", handleScroll, { capture: true });
+    };
+  }, []);
 
   const fetchTables = async () => {
     setLoading(true);
@@ -752,7 +781,7 @@ export default function Tables() {
                                 {selectedTable.columns?.map((col, i) => (
                                   <th
                                     key={i}
-                                    className="text-left bg-[#141414]! py-0 px-0 text-neutral-400 font-medium border-b border-r border-border last:border-r-0"
+                                    className="text-left bg-card! py-0 px-0 text-neutral-400 font-medium border-b border-r border-border last:border-r-0"
                                   >
                                     <button
                                       onClick={() => handleSort(col.name)}
@@ -789,7 +818,7 @@ export default function Tables() {
                                 {selectedTable.relations?.map((relation, i) => (
                                   <th
                                     key={`relation-${i}`}
-                                    className="text-left bg-[#141414]! py-0 px-0 text-neutral-400 font-medium border-b border-r border-border last:border-r-0 min-w-[170px]"
+                                    className="text-left bg-card! py-0 px-0 text-neutral-400 font-medium border-b border-r border-border last:border-r-0 min-w-[170px]"
                                   >
                                     <div className="w-full h-full flex flex-row items-center justify-between gap-2 px-2 py-2">
                                       <span className="truncate">
@@ -1054,113 +1083,226 @@ export default function Tables() {
                             </tbody>
                           </table>
                         </div>
-                        <div className="p-3 border-t border-border flex items-center justify-between bg-[#141414] shrink-0">
-                          <div className="flex items-center gap-4">
-                            <span className="text-xs text-neutral-500">
-                              Showing{" "}
-                              {Math.min(
-                                (currentPage - 1) * rowsPerPage + 1,
-                                totalRows,
-                              )}{" "}
-                              to{" "}
-                              {Math.min(currentPage * rowsPerPage, totalRows)}{" "}
-                              of {totalRows} rows
-                            </span>
-                            <div className="flex items-center gap-2">
-                              <label className="text-xs text-neutral-500">
-                                Rows per page:
-                              </label>
-                              <select
-                                value={rowsPerPage}
-                                onChange={(e) => {
-                                  const newLimit = parseInt(e.target.value, 10);
-                                  setRowsPerPage(newLimit);
-                                  setCurrentPage(1);
-                                  fetchTableData(
-                                    selectedTable?.name,
-                                    1,
-                                    newLimit,
-                                  );
+                        <div className="shrink-0 border-t border-border">
+                          <div
+                            className={`fixed left-1/2 right-auto z-40 w-[calc(100%-1rem)] max-w-56 -translate-x-1/2 rounded-xl border border-border bg-card px-2 py-1.5 shadow-2xl transition-all duration-300 bottom-[calc(env(safe-area-inset-bottom)+5.5rem)] md:static md:left-auto md:right-auto md:w-auto md:max-w-none md:translate-x-0 md:translate-y-0 md:rounded-none md:border-0 md:bg-card md:p-3 md:shadow-none md:transition-none ${
+                              isMobilePagerVisible
+                                ? "translate-y-0 opacity-100"
+                                : "translate-y-6 opacity-0 pointer-events-none"
+                            } md:opacity-100 md:pointer-events-auto`}
+                          >
+                            <div className="flex items-center justify-between md:hidden">
+                              <button
+                                onClick={() => {
+                                  if (currentPage > 1) {
+                                    fetchTableData(
+                                      selectedTable.name,
+                                      currentPage - 1,
+                                      rowsPerPage,
+                                    );
+                                  }
                                 }}
-                                className="text-xs bg-neutral-700 text-neutral-200 border border-border rounded px-2 py-1 outline-none focus:border-blue-500"
+                                disabled={currentPage === 1}
+                                className="p-1 rounded hover:bg-neutral-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                                title="Previous page"
                               >
-                                <option value={25}>25</option>
-                                <option value={50}>50</option>
-                                <option value={100}>100</option>
-                                <option value={250}>250</option>
-                                <option value={500}>500</option>
-                              </select>
-                            </div>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <button
-                              onClick={() => {
-                                if (currentPage > 1) {
-                                  fetchTableData(
-                                    selectedTable.name,
-                                    currentPage - 1,
-                                    rowsPerPage,
-                                  );
-                                }
-                              }}
-                              disabled={currentPage === 1}
-                              className="p-1.5 rounded hover:bg-neutral-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-                              title="Previous page"
-                            >
-                              <svg
-                                xmlns="http://www.w3.org/2000/svg"
-                                width="16"
-                                height="16"
-                                viewBox="0 0 24 24"
-                                fill="none"
-                                stroke="currentColor"
-                                strokeWidth="2"
-                                strokeLinecap="round"
-                                strokeLinejoin="round"
-                                className="text-neutral-400"
-                              >
-                                <polyline points="15 18 9 12 15 6"></polyline>
-                              </svg>
-                            </button>
-                            <span className="text-xs text-neutral-400 min-w-[60px] text-center">
-                              Page {currentPage} of{" "}
-                              {Math.ceil(totalRows / rowsPerPage) || 1}
-                            </span>
-                            <button
-                              onClick={() => {
-                                if (
-                                  currentPage <
+                                <svg
+                                  xmlns="http://www.w3.org/2000/svg"
+                                  width="16"
+                                  height="16"
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  strokeWidth="2"
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  className="text-neutral-400"
+                                >
+                                  <polyline points="15 18 9 12 15 6"></polyline>
+                                </svg>
+                              </button>
+                              <div className="flex items-center gap-2">
+                                <Select
+                                  value={String(rowsPerPage)}
+                                  onValueChange={(val) => {
+                                    const newLimit = parseInt(val, 10);
+                                    setRowsPerPage(newLimit);
+                                    setCurrentPage(1);
+                                    fetchTableData(
+                                      selectedTable?.name,
+                                      1,
+                                      newLimit,
+                                    );
+                                  }}
+                                >
+                                  <SelectTrigger className="h-fit! w-fit! text-[11px] bg-card text-neutral-200 border border-border/70 rounded-full px-2 py-1">
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    {[25, 50, 100, 250, 500].map((n) => (
+                                      <SelectItem key={n} value={String(n)}>
+                                        {n}
+                                      </SelectItem>
+                                    ))}
+                                  </SelectContent>
+                                </Select>
+                                <div className="w-px h-7 bg-muted" />
+                                <span className="text-[11px] text-neutral-400 min-w-[44px] text-center tabular-nums">
+                                  {currentPage}/
+                                  {Math.ceil(totalRows / rowsPerPage) || 1}
+                                </span>
+                              </div>
+                              <button
+                                onClick={() => {
+                                  if (
+                                    currentPage <
+                                    Math.ceil(totalRows / rowsPerPage)
+                                  ) {
+                                    fetchTableData(
+                                      selectedTable.name,
+                                      currentPage + 1,
+                                      rowsPerPage,
+                                    );
+                                  }
+                                }}
+                                disabled={
+                                  currentPage >=
                                   Math.ceil(totalRows / rowsPerPage)
-                                ) {
-                                  fetchTableData(
-                                    selectedTable.name,
-                                    currentPage + 1,
-                                    rowsPerPage,
-                                  );
                                 }
-                              }}
-                              disabled={
-                                currentPage >=
-                                Math.ceil(totalRows / rowsPerPage)
-                              }
-                              className="p-1.5 rounded hover:bg-neutral-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-                              title="Next page"
-                            >
-                              <svg
-                                xmlns="http://www.w3.org/2000/svg"
-                                width="16"
-                                height="16"
-                                viewBox="0 0 24 24"
-                                fill="none"
-                                stroke="currentColor"
-                                strokeWidth="2"
-                                strokeLinecap="round"
-                                strokeLinejoin="round"
-                                className="text-neutral-400"
+                                className="p-1 rounded hover:bg-neutral-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                                title="Next page"
                               >
-                                <polyline points="9 18 15 12 9 6"></polyline>
-                              </svg>
-                            </button>
+                                <svg
+                                  xmlns="http://www.w3.org/2000/svg"
+                                  width="16"
+                                  height="16"
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  strokeWidth="2"
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  className="text-neutral-400"
+                                >
+                                  <polyline points="9 18 15 12 9 6"></polyline>
+                                </svg>
+                              </button>
+                            </div>
+                            <div className="hidden md:flex items-center justify-between gap-4">
+                              <div className="flex items-center gap-4 min-w-0">
+                                <span className="text-xs text-neutral-500">
+                                  Showing{" "}
+                                  {Math.min(
+                                    (currentPage - 1) * rowsPerPage + 1,
+                                    totalRows,
+                                  )}{" "}
+                                  to{" "}
+                                  {Math.min(
+                                    currentPage * rowsPerPage,
+                                    totalRows,
+                                  )}{" "}
+                                  of {totalRows} rows
+                                </span>
+                                <div className="flex items-center gap-2">
+                                  <label className="text-xs text-neutral-500">
+                                    Rows per page:
+                                  </label>
+                                  <select
+                                    value={rowsPerPage}
+                                    onChange={(e) => {
+                                      const newLimit = parseInt(
+                                        e.target.value,
+                                        10,
+                                      );
+                                      setRowsPerPage(newLimit);
+                                      setCurrentPage(1);
+                                      fetchTableData(
+                                        selectedTable?.name,
+                                        1,
+                                        newLimit,
+                                      );
+                                    }}
+                                    className="text-xs bg-neutral-700 text-neutral-200 border border-border rounded px-2 py-1 outline-none focus:border-blue-500"
+                                  >
+                                    <option value={25}>25</option>
+                                    <option value={50}>50</option>
+                                    <option value={100}>100</option>
+                                    <option value={250}>250</option>
+                                    <option value={500}>500</option>
+                                  </select>
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-1.5 self-center md:self-auto">
+                                <button
+                                  onClick={() => {
+                                    if (currentPage > 1) {
+                                      fetchTableData(
+                                        selectedTable.name,
+                                        currentPage - 1,
+                                        rowsPerPage,
+                                      );
+                                    }
+                                  }}
+                                  disabled={currentPage === 1}
+                                  className="p-1 rounded hover:bg-neutral-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                                  title="Previous page"
+                                >
+                                  <svg
+                                    xmlns="http://www.w3.org/2000/svg"
+                                    width="16"
+                                    height="16"
+                                    viewBox="0 0 24 24"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="2"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                    className="text-neutral-400"
+                                  >
+                                    <polyline points="15 18 9 12 15 6"></polyline>
+                                  </svg>
+                                </button>
+                                <span className="text-xs text-neutral-400 min-w-[60px] text-center tabular-nums">
+                                  Page {currentPage} of{" "}
+                                  {Math.ceil(totalRows / rowsPerPage) || 1}
+                                </span>
+                                <button
+                                  onClick={() => {
+                                    if (
+                                      currentPage <
+                                      Math.ceil(totalRows / rowsPerPage)
+                                    ) {
+                                      fetchTableData(
+                                        selectedTable.name,
+                                        currentPage + 1,
+                                        rowsPerPage,
+                                      );
+                                    }
+                                  }}
+                                  disabled={
+                                    currentPage >=
+                                    Math.ceil(totalRows / rowsPerPage)
+                                  }
+                                  className="p-1 rounded hover:bg-neutral-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                                  title="Next page"
+                                >
+                                  <svg
+                                    xmlns="http://www.w3.org/2000/svg"
+                                    width="16"
+                                    height="16"
+                                    viewBox="0 0 24 24"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="2"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                    className="text-neutral-400"
+                                  >
+                                    <polyline points="9 18 15 12 9 6"></polyline>
+                                  </svg>
+                                </button>
+                              </div>
+                            </div>
                           </div>
                         </div>
                       </>
@@ -1310,12 +1452,12 @@ const TableSkeleton = ({ name }: { name: string | null }) => (
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
       <div className="flex-1 overflow-auto">
         <table className="w-full text-sm border-separate border-spacing-0">
-          <thead className="bg-[#141414]!">
+          <thead className="bg-card!">
             <tr className="sticky top-0 z-20">
               {Array.from({ length: 6 }).map((_, i) => (
                 <th
                   key={i}
-                  className="text-left bg-[#141414]! py-[8px] px-2 border-b border-r border-border last:border-r-0"
+                  className="text-left bg-card! py-[8px] px-2 border-b border-r border-border last:border-r-0"
                 >
                   <Skeleton className="h-5 w-20" />
                 </th>
@@ -1339,7 +1481,7 @@ const TableSkeleton = ({ name }: { name: string | null }) => (
         </table>
       </div>
       {/* Pagination Skeleton */}
-      <div className="p-3 border-t border-border flex items-center justify-between bg-[#141414] shrink-0">
+      <div className="p-3 border-t border-border flex items-center justify-between bg-card shrink-0">
         <Skeleton className="h-4 w-64" />
         <Skeleton className="h-6 w-32" />
       </div>

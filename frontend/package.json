@@ -14,6 +14,7 @@
     "@tailwindcss/vite": "^4.1.18",
     "@tanstack/react-query": "^5.90.21",
     "@types/prismjs": "^1.26.6",
+    "@xyflow/react": "^12.10.1",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "facehash": "^0.0.7",

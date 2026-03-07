@@ -3,15 +3,31 @@ import {
   ArrowClockwiseIcon,
   CubeIcon,
   GlobeIcon,
-  ListBulletsIcon,
-  PlayIcon,
-  StopIcon,
   TerminalIcon,
   TerminalWindowIcon,
 } from "@phosphor-icons/react";
+import {
+  BaseEdge,
+  Background,
+  BackgroundVariant,
+  ConnectionLineType,
+  Handle,
+  MarkerType,
+  Position,
+  ReactFlow,
+  type Edge,
+  type EdgeProps,
+  type Node,
+  type NodeMouseHandler,
+  type NodeProps,
+  type ReactFlowInstance,
+  type Viewport,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   Dialog,
   DialogContent,
@@ -91,10 +107,40 @@ interface GraphEdge {
   kind: "belongs" | "exposes" | "route";
 }
 
-interface MapViewport {
-  x: number;
-  y: number;
-  scale: number;
+interface TopologyNodeData extends Record<string, unknown> {
+  node: GraphNode;
+  isSelected: boolean;
+  isRelated: boolean;
+  outboundRouteCount: number;
+  hasIncoming: boolean;
+  hasOutgoing: boolean;
+  containerMatch?: ContainerInfo;
+  actionLoading?: "start" | "stop" | "restart" | "logs";
+  isAdmin: boolean;
+  onSelect: (nodeId: string) => void;
+  onOpen: (node: GraphNode, containerMatch?: ContainerInfo) => void;
+  onOpenLogs: (container: ContainerInfo) => void;
+  onContainerAction: (
+    container: ContainerInfo,
+    action: "start" | "stop" | "restart",
+  ) => void;
+  onOpenProxyLogs: () => void;
+}
+
+type TopologyFlowNode = Node<TopologyNodeData, "topologyNode">;
+type TopologyFlowEdge = Edge;
+
+function ProxyRouteEdge({
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  style,
+}: EdgeProps<TopologyFlowEdge>) {
+  const laneX = sourceX + 34;
+  const path = `M ${sourceX} ${sourceY} L ${laneX} ${sourceY} L ${laneX} ${targetY} L ${targetX} ${targetY}`;
+
+  return <BaseEdge path={path} style={style} />;
 }
 
 const NAME_FALLBACK = "unnamed";
@@ -103,6 +149,105 @@ const MAX_SCALE = 2.2;
 
 const BASEFUL_SIMULATED_LABEL = "baseful.simulated";
 const BASEFUL_SIMULATED_ID = "local-baseful-simulated";
+const DEFAULT_CARD_WIDTH = 220;
+const CONTAINER_CARD_WIDTH = 276;
+const INTERNET_CARD_WIDTH = 232;
+const DEFAULT_CARD_HEIGHT = 150;
+const CONTAINER_CARD_HEIGHT = 186;
+const SERVICE_CARD_HEIGHT = 188;
+const INTERNET_CARD_HEIGHT = 164;
+const MAX_RENDERED_TERMINAL_LINES = 1200;
+const MAX_RENDERED_LOG_CHARS = 300000;
+const MAX_RENDERED_LOG_LINES = 4000;
+
+function getNodeCardDimensions(node: GraphNode) {
+  return {
+    width:
+      node.kind === "internet"
+        ? INTERNET_CARD_WIDTH
+        : node.kind === "container"
+          ? CONTAINER_CARD_WIDTH
+          : DEFAULT_CARD_WIDTH,
+    height:
+      node.kind === "internet"
+        ? INTERNET_CARD_HEIGHT
+        : node.kind === "service"
+          ? SERVICE_CARD_HEIGHT
+          : node.kind === "container"
+            ? CONTAINER_CARD_HEIGHT
+            : DEFAULT_CARD_HEIGHT,
+  };
+}
+
+type LogLevel =
+  | "error"
+  | "warning"
+  | "success"
+  | "hint"
+  | "info"
+  | "debug"
+  | "default";
+
+function classifyLogLine(line: string): LogLevel {
+  const normalized = line.toLowerCase();
+
+  if (
+    /\b(fatal|panic|error|exception|failed|permission denied|operation not permitted)\b/.test(
+      normalized,
+    )
+  ) {
+    return "error";
+  }
+  if (/\b(warn|warning|deprecated|retry)\b/.test(normalized)) {
+    return "warning";
+  }
+  if (/\b(success|ready|started|complete|done|listening)\b/.test(normalized)) {
+    return "success";
+  }
+  if (/\b(hint|tip|suggestion)\b/.test(normalized)) {
+    return "hint";
+  }
+  if (/\b(debug|trace|verbose)\b/.test(normalized)) {
+    return "debug";
+  }
+  if (/\b(info|notice|log)\b/.test(normalized)) {
+    return "info";
+  }
+  return "default";
+}
+
+function getLogLevelClass(level: LogLevel): string {
+  switch (level) {
+    case "error":
+      return "text-red-300";
+    case "warning":
+      return "text-amber-300";
+    case "success":
+      return "text-emerald-300";
+    case "hint":
+      return "text-cyan-300";
+    case "info":
+      return "text-blue-300";
+    case "debug":
+      return "text-violet-300";
+    default:
+      return "text-neutral-300";
+  }
+}
+
+function splitDockerLogLine(line: string): { prefix: string; body: string } {
+  const dockerTimestampMatch = line.match(
+    /^(\d{4}-\d{2}-\d{2}T[0-9:.+-]+Z?)\s?(.*)$/,
+  );
+  if (!dockerTimestampMatch) {
+    return { prefix: "", body: line };
+  }
+
+  return {
+    prefix: dockerTimestampMatch[1],
+    body: dockerTimestampMatch[2] || "",
+  };
+}
 
 function getContainerName(container: ContainerInfo): string {
   return container.names?.[0]?.replace("/", "") || NAME_FALLBACK;
@@ -218,7 +363,7 @@ function buildTopology(
   };
 
   let currentY = 80;
-  const yGap = 160;
+  const yGap = 220;
 
   const projectY = new Map<string, number>();
   projects.forEach((project) => {
@@ -456,6 +601,402 @@ const DockerLogoSVG = ({ className }: { className?: string }) => (
   </svg>
 );
 
+function TopologyNodeCard({ data }: NodeProps<TopologyFlowNode>) {
+  const {
+    node,
+    isSelected,
+    isRelated,
+    outboundRouteCount,
+    hasIncoming,
+    hasOutgoing,
+    containerMatch,
+    actionLoading,
+    isAdmin,
+    onSelect,
+    onOpen,
+    onOpenLogs,
+    onContainerAction,
+    onOpenProxyLogs,
+  } = data;
+  const isContainer = node.kind === "container";
+  const { width: cardWidth, height: cardHeight } = getNodeCardDimensions(node);
+
+  let iconNode = <CubeIcon className="w-4 h-4 text-neutral-400" />;
+  let nodeTypeStr = "Node";
+
+  if (node.kind === "project") {
+    const isBaseful = node.label.toLowerCase() === "baseful";
+    iconNode = isBaseful ? (
+      <div className="bg-muted rounded-sm p-1 size-4">
+        <img src="/logo.png" alt="Baseful" className="object-contain" />
+      </div>
+    ) : (
+      <DitherAvatar value={node.label} size={16} />
+    );
+    nodeTypeStr = "Project";
+  } else if (node.kind === "service") {
+    iconNode = <ServiceIconSVG className="w-4 h-4 text-neutral-400" />;
+    nodeTypeStr = "Service";
+  } else if (node.kind === "internet") {
+    iconNode = <GlobeIcon className="w-4 h-4 text-blue-300" />;
+    nodeTypeStr = "Internet";
+  } else if (node.kind === "network") {
+    iconNode = <NetworkIconSVG className="w-4 h-4 text-neutral-400" />;
+    nodeTypeStr = "Network";
+  } else if (isContainer) {
+    iconNode = node.isSimulated ? (
+      <CubeIcon className="w-4 h-4 text-amber-300" />
+    ) : (
+      <DockerLogoSVG className="w-4 h-4 text-neutral-300" />
+    );
+    nodeTypeStr = "Container";
+  }
+
+  const actionsDisabled = node.isSimulated || Boolean(actionLoading);
+  const actionButtonClass = `h-7 flex-1 min-w-0 px-2 py-0 border rounded-md flex items-center justify-center text-[10px] uppercase tracking-wider font-semibold border-neutral-700 ${
+    actionsDisabled
+      ? "opacity-40 pointer-events-none"
+      : "hover:bg-neutral-800 cursor-pointer"
+  }`;
+  const openButtonClass =
+    "h-7 flex-1 min-w-0 px-2 py-0 border rounded-md flex items-center justify-center text-[10px] uppercase tracking-wider font-semibold border-neutral-700 hover:bg-neutral-800 cursor-pointer";
+
+  return (
+    <div
+      className={`rounded-[10px] border flex flex-col select-none transition-colors overflow-hidden ${
+        isSelected
+          ? "bg-neutral-800 border-neutral-500 shadow-xl"
+          : isRelated
+            ? "bg-[#181818] border-neutral-600 shadow-md"
+            : "bg-[#121212] border-[#2a2a2a] shadow-md hover:border-[#3e3e3e]"
+      }`}
+      style={{ width: cardWidth, height: cardHeight }}
+      onClick={() => onSelect(node.id)}
+    >
+      {hasIncoming && (
+        <Handle
+          type="target"
+          position={Position.Left}
+          id="target-main"
+          isConnectable={false}
+          className="!h-2.5 !w-2.5 !rounded-full !border !border-neutral-700 !bg-[#111111] !left-[-5px] !cursor-default !pointer-events-none"
+        />
+      )}
+      {node.kind === "container" && hasIncoming && (
+        <Handle
+          type="target"
+          position={Position.Left}
+          id="target-route"
+          isConnectable={false}
+          style={{ top: "38%" }}
+          className="!h-2.5 !w-2.5 !rounded-full !border !border-neutral-700 !bg-[#111111] !left-[-5px] !cursor-default !pointer-events-none"
+        />
+      )}
+      {hasOutgoing && (
+        <Handle
+          type="source"
+          position={Position.Right}
+          id="source-main"
+          isConnectable={false}
+          className="!h-2.5 !w-2.5 !rounded-full !border !border-neutral-700 !bg-[#111111] !right-[-5px] !cursor-default !pointer-events-none"
+        />
+      )}
+      {node.id === "service:proxy" && hasOutgoing && (
+        <Handle
+          type="source"
+          position={Position.Right}
+          id="source-route"
+          isConnectable={false}
+          style={{ top: "58%", right: -5 }}
+          className="!h-2.5 !w-2.5 !rounded-full !border !border-neutral-700 !bg-[#111111] !cursor-default !pointer-events-none"
+        />
+      )}
+      <div
+        className={`flex items-center gap-2.5 px-3 ${
+          isContainer ? "h-[46px]" : "h-[34px]"
+        } border-b ${isSelected ? "border-neutral-600" : "border-[#2a2a2a]"}`}
+      >
+        <div className="flex-shrink-0 flex items-center justify-center">
+          {iconNode}
+        </div>
+        <div className="flex items-center gap-1.5 min-w-0 flex-1 justify-between">
+          <span className="text-xs font-semibold text-neutral-300 truncate leading-tight">
+            {node.label}
+          </span>
+          <div className="flex items-center gap-1.5 flex-shrink-0">
+            {node.kind === "service" && (
+              <span
+                className={`text-[10px] tracking-tight uppercase font-medium px-1.5 py-0.5 rounded border ${
+                  node.status?.toLowerCase() === "running"
+                    ? "text-emerald-300 bg-emerald-500/10 border-emerald-500/30"
+                    : "text-neutral-300 bg-neutral-700/30 border-neutral-600"
+                }`}
+              >
+                {node.status || "Unknown"}
+              </span>
+            )}
+            {node.version && node.kind !== "service" && (
+              <span className="text-[10px] tracking-tight uppercase text-neutral-400 font-medium px-1.5 py-0.5 bg-[#1f1f1f] rounded border border-[#2a2a2a]">
+                {node.version}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+      <div className="flex-1 flex flex-col px-3 py-2 justify-center">
+        {isContainer ? (
+          <div className="space-y-2.5">
+            <div className="flex flex-col gap-0.5">
+              <span className="text-[9px] text-neutral-500 font-bold uppercase tracking-widest">
+                Internal IP
+              </span>
+              <span className="text-[10px] text-neutral-300 font-mono bg-neutral-900/50 px-1.5 py-0.5 rounded border border-white/5 w-fit">
+                {node.ip || "N/A"}
+              </span>
+            </div>
+            <div className="flex flex-col gap-0.5">
+              <span className="text-[9px] text-neutral-500 font-bold uppercase tracking-widest">
+                Uptime
+              </span>
+              <span className="text-[10px] text-neutral-300 truncate leading-tight">
+                {node.status?.replace("Up ", "") || "N/A"}
+              </span>
+            </div>
+          </div>
+        ) : node.kind === "project" ? (
+          <div className="space-y-2">
+            <span className="text-[9px] text-neutral-500 font-bold uppercase tracking-widest block">
+              Project Members
+            </span>
+            <div className="flex -space-x-1.5 overflow-hidden">
+              {(node.users || []).slice(0, 7).map((u, i) => (
+                <div
+                  key={i}
+                  className="h-6 w-6 rounded-full border-2 border-neutral-700 flex items-center justify-center overflow-hidden bg-muted"
+                >
+                  {u.avatarUrl ? (
+                    <img
+                      src={u.avatarUrl}
+                      className="size-full object-cover"
+                      alt=""
+                    />
+                  ) : (
+                    <LetterAvatar
+                      name={u.email}
+                      size={20}
+                      className="rounded-full"
+                    />
+                  )}
+                </div>
+              ))}
+              {(node.users?.length || 0) > 7 && (
+                <div className="inline-flex h-6 min-w-6 px-1 rounded-full border-2 border-neutral-700 items-center justify-center bg-neutral-800 text-[10px] font-semibold text-neutral-200">
+                  +{(node.users?.length || 0) - 7}
+                </div>
+              )}
+              {(!node.users || node.users.length === 0) && (
+                <span className="text-[10px] text-neutral-500 italic">
+                  No members assigned
+                </span>
+              )}
+            </div>
+          </div>
+        ) : node.kind === "network" ? (
+          <div className="space-y-1">
+            <span className="text-[9px] text-neutral-500 font-bold uppercase tracking-widest block">
+              Network Status
+            </span>
+            <div className="flex items-center justify-between bg-blue-500/5 border border-blue-500/10 rounded px-2 py-1.5">
+              <span className="text-[10px] text-blue-400 font-bold tracking-tight">
+                {node.count} {node.count === 1 ? "Container" : "Containers"}{" "}
+                Active
+              </span>
+            </div>
+          </div>
+        ) : node.kind === "service" ? (
+          <div className="space-y-2">
+            <div className="flex flex-col gap-0.5">
+              <span className="text-[9px] text-neutral-500 font-bold uppercase tracking-widest">
+                Endpoint
+              </span>
+              <span className="text-[10px] text-neutral-300 font-mono bg-neutral-900/50 px-1.5 py-0.5 rounded border border-white/5 w-fit max-w-full truncate">
+                {node.version || "N/A"}
+              </span>
+            </div>
+            <div className="flex items-center justify-between rounded border border-white/5 bg-neutral-900/40 px-2 py-1">
+              <span className="text-[9px] text-neutral-500 font-bold uppercase tracking-wider">
+                Active Routes
+              </span>
+              <span className="text-[10px] text-neutral-300 font-semibold">
+                {outboundRouteCount}
+              </span>
+            </div>
+            {node.id === "service:proxy" && isAdmin && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onOpenProxyLogs();
+                }}
+                className={`h-7 w-full rounded border px-2 text-[10px] uppercase tracking-wider font-semibold transition-colors ${
+                  actionLoading
+                    ? "border-neutral-700 text-neutral-500 cursor-not-allowed"
+                    : "border-neutral-700 text-neutral-300 hover:bg-neutral-800"
+                }`}
+                disabled={Boolean(actionLoading)}
+              >
+                View Logs
+              </button>
+            )}
+          </div>
+        ) : node.kind === "internet" ? (
+          <div className="space-y-2.5">
+            <div className="flex items-center justify-between rounded border border-sky-500/20 bg-sky-500/5 px-2 py-1.5">
+              <span className="text-[9px] text-sky-200 font-bold uppercase tracking-wider">
+                Public Entry
+              </span>
+              <span className="text-[10px] text-sky-300 font-semibold">
+                Active
+              </span>
+            </div>
+            <div className="grid grid-cols-2 gap-1.5">
+              <div className="rounded border border-white/5 bg-neutral-900/40 px-2 py-1.5">
+                <div className="text-[8px] text-neutral-500 font-bold uppercase tracking-wider">
+                  Protocol
+                </div>
+                <div className="text-[10px] text-neutral-200 font-mono">
+                  HTTP(S)
+                </div>
+              </div>
+              <div className="rounded border border-white/5 bg-neutral-900/40 px-2 py-1.5">
+                <div className="text-[8px] text-neutral-500 font-bold uppercase tracking-wider">
+                  Routed To
+                </div>
+                <div className="text-[10px] text-neutral-200 font-semibold">
+                  {outboundRouteCount} Service
+                  {outboundRouteCount === 1 ? "" : "s"}
+                </div>
+              </div>
+            </div>
+            <div className="text-[9px] text-neutral-400 leading-tight">
+              External traffic enters here before being forwarded to the proxy
+              layer.
+            </div>
+          </div>
+        ) : (
+          node.detail && (
+            <span className="text-[11px] text-neutral-400 truncate leading-tight">
+              {nodeTypeStr}
+            </span>
+          )
+        )}
+      </div>
+      {(isContainer || node.kind === "project") && (
+        <div
+          className={`flex items-center px-3 border-t gap-1 ${
+            isContainer ? "h-[48px]" : "h-[40px]"
+          } ${isSelected ? "border-neutral-600" : "border-[#2a2a2a]"}`}
+        >
+          {isContainer && containerMatch && !node.isSimulated && (
+            <>
+              <div
+                role="button"
+                tabIndex={0}
+                onClick={(e) => {
+                  if (actionsDisabled) return;
+                  e.stopPropagation();
+                  onOpenLogs(containerMatch);
+                }}
+                onKeyDown={(e) => {
+                  if (
+                    (e.key === "Enter" || e.key === " ") &&
+                    !actionsDisabled
+                  ) {
+                    e.preventDefault();
+                    onOpenLogs(containerMatch);
+                  }
+                }}
+                className={actionButtonClass}
+                title="View logs"
+              >
+                Logs
+              </div>
+              <div
+                role="button"
+                tabIndex={0}
+                onClick={(e) => {
+                  if (actionsDisabled) return;
+                  e.stopPropagation();
+                  onContainerAction(
+                    containerMatch,
+                    containerMatch.state === "running" ? "stop" : "start",
+                  );
+                }}
+                onKeyDown={(e) => {
+                  if (
+                    (e.key === "Enter" || e.key === " ") &&
+                    !actionsDisabled
+                  ) {
+                    e.preventDefault();
+                    onContainerAction(
+                      containerMatch,
+                      containerMatch.state === "running" ? "stop" : "start",
+                    );
+                  }
+                }}
+                className={actionButtonClass}
+                title={containerMatch.state === "running" ? "Stop" : "Start"}
+              >
+                {containerMatch.state === "running" ? "Stop" : "Start"}
+              </div>
+              <div
+                role="button"
+                tabIndex={0}
+                onClick={(e) => {
+                  if (actionsDisabled) return;
+                  e.stopPropagation();
+                  onContainerAction(containerMatch, "restart");
+                }}
+                onKeyDown={(e) => {
+                  if (
+                    (e.key === "Enter" || e.key === " ") &&
+                    !actionsDisabled
+                  ) {
+                    e.preventDefault();
+                    onContainerAction(containerMatch, "restart");
+                  }
+                }}
+                className={actionButtonClass}
+                title="Restart"
+              >
+                Restart
+              </div>
+            </>
+          )}
+          <div
+            role="button"
+            tabIndex={0}
+            onClick={(e) => {
+              e.stopPropagation();
+              onSelect(node.id);
+              onOpen(node, containerMatch);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onSelect(node.id);
+              }
+            }}
+            className={openButtonClass}
+          >
+            Open
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Containers() {
   const { token, logout, user } = useAuth();
   const [containers, setContainers] = useState<ContainerInfo[]>([]);
@@ -476,16 +1017,15 @@ export default function Containers() {
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [command, setCommand] = useState("");
   const [executing, setExecuting] = useState(false);
-  const [viewport, setViewport] = useState<MapViewport>({
+  const [flowViewport, setFlowViewport] = useState<Viewport>({
     x: 0,
     y: 0,
-    scale: 1,
+    zoom: 1,
   });
-  const [isPanning, setIsPanning] = useState(false);
-  const [mapViewportSize, setMapViewportSize] = useState({
-    width: 960,
-    height: 620,
-  });
+  const [reactFlowInstance, setReactFlowInstance] = useState<ReactFlowInstance<
+    TopologyFlowNode,
+    TopologyFlowEdge
+  > | null>(null);
 
   const [manageProjectDialogOpen, setManageProjectDialogOpen] = useState(false);
   const [basefulUsersDrawerOpen, setBasefulUsersDrawerOpen] = useState(false);
@@ -501,31 +1041,68 @@ export default function Containers() {
   const [logsLoading, setLogsLoading] = useState(false);
   const [logsContainerName, setLogsContainerName] = useState("");
   const [logsContent, setLogsContent] = useState("");
+  const [pendingContainerAction, setPendingContainerAction] = useState<{
+    container: ContainerInfo;
+    action: "start" | "stop" | "restart";
+  } | null>(null);
   const [isMobileDrawer, setIsMobileDrawer] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  const logsScrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const mapViewportRef = useRef<HTMLDivElement>(null);
   const mapInitializedRef = useRef(false);
-  const panStateRef = useRef({
-    active: false,
-    moved: false,
-    pointerStartX: 0,
-    pointerStartY: 0,
-    viewportStartX: 0,
-    viewportStartY: 0,
-  });
-  const safariGestureScaleRef = useRef(1);
 
   const terminalOutput = useMemo(
     () =>
       selectedContainer ? containerHistory[selectedContainer.id] || [] : [],
     [selectedContainer, containerHistory],
   );
+  const renderedTerminalOutput = useMemo(() => {
+    const hiddenCount = Math.max(
+      0,
+      terminalOutput.length - MAX_RENDERED_TERMINAL_LINES,
+    );
+    return {
+      hiddenCount,
+      lines:
+        hiddenCount > 0
+          ? terminalOutput.slice(-MAX_RENDERED_TERMINAL_LINES)
+          : terminalOutput,
+    };
+  }, [terminalOutput]);
   const currentPath = useMemo(
     () => (selectedContainer ? containerCwd[selectedContainer.id] || "/" : "/"),
     [selectedContainer, containerCwd],
   );
+  const renderedLogsContent = useMemo(() => {
+    const hiddenChars = Math.max(
+      0,
+      logsContent.length - MAX_RENDERED_LOG_CHARS,
+    );
+    return {
+      hiddenChars,
+      text:
+        hiddenChars > 0
+          ? logsContent.slice(-MAX_RENDERED_LOG_CHARS)
+          : logsContent,
+    };
+  }, [logsContent]);
+  const renderedLogLines = useMemo(() => {
+    const lines = renderedLogsContent.text.split(/\r?\n/);
+    const hiddenLineCount = Math.max(0, lines.length - MAX_RENDERED_LOG_LINES);
+    const visibleLines =
+      hiddenLineCount > 0 ? lines.slice(-MAX_RENDERED_LOG_LINES) : lines;
+    return { hiddenLineCount, lines: visibleLines };
+  }, [renderedLogsContent.text]);
+
+  const scrollTerminalToBottom = useCallback(() => {
+    if (!scrollRef.current) return;
+    scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, []);
+  const scrollLogsToBottom = useCallback(() => {
+    if (!logsScrollRef.current) return;
+    logsScrollRef.current.scrollTop = logsScrollRef.current.scrollHeight;
+  }, []);
 
   useEffect(() => {
     if (!executing && selectedContainer) {
@@ -752,6 +1329,27 @@ export default function Containers() {
     }
   }, [logout, token]);
 
+  const confirmContainerAction = useCallback(async () => {
+    if (!pendingContainerAction) return;
+    await handleContainerAction(
+      pendingContainerAction.container,
+      pendingContainerAction.action,
+    );
+    setPendingContainerAction(null);
+  }, [handleContainerAction, pendingContainerAction]);
+
+  const pendingActionTitle = pendingContainerAction
+    ? `${pendingContainerAction.action === "restart" ? "Restart" : pendingContainerAction.action === "stop" ? "Stop" : "Start"} container?`
+    : "Confirm container action";
+
+  const pendingActionDescription = pendingContainerAction
+    ? pendingContainerAction.action === "stop"
+      ? `This will stop "${getContainerDisplayNames(pendingContainerAction.container).clean}" immediately. The database will go offline until it is started again.`
+      : pendingContainerAction.action === "restart"
+        ? `This will restart "${getContainerDisplayNames(pendingContainerAction.container).clean}". The database will go offline during restart and return once it is up again.`
+        : `This will start "${getContainerDisplayNames(pendingContainerAction.container).clean}". The database will come online after startup completes.`
+    : "Please confirm this action.";
+
   const handleExecute = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!command || !selectedContainer || executing) return;
@@ -837,10 +1435,33 @@ export default function Containers() {
   };
 
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [terminalOutput]);
+    const frame = requestAnimationFrame(() => {
+      scrollTerminalToBottom();
+      requestAnimationFrame(scrollTerminalToBottom);
+    });
+
+    return () => cancelAnimationFrame(frame);
+  }, [
+    selectedContainer,
+    renderedTerminalOutput.lines.length,
+    scrollTerminalToBottom,
+  ]);
+
+  useEffect(() => {
+    if (!logsDialogOpen) return;
+
+    const frame = requestAnimationFrame(() => {
+      scrollLogsToBottom();
+      requestAnimationFrame(scrollLogsToBottom);
+    });
+
+    return () => cancelAnimationFrame(frame);
+  }, [
+    logsDialogOpen,
+    logsLoading,
+    renderedLogsContent.text.length,
+    scrollLogsToBottom,
+  ]);
 
   const parseAnsi = (text: string) => {
     const escapePrefix = `${String.fromCharCode(27)}[`;
@@ -914,254 +1535,6 @@ export default function Containers() {
     () => buildTopology(containers, projectsById, allUsers, proxyInfo),
     [containers, projectsById, allUsers, proxyInfo],
   );
-  const nodeById = useMemo(
-    () => Object.fromEntries(topology.nodes.map((n) => [n.id, n])),
-    [topology.nodes],
-  );
-
-  const topologyBounds = useMemo(() => {
-    if (topology.nodes.length === 0) {
-      return {
-        minX: 0,
-        minY: 0,
-        maxX: 1200,
-        maxY: 700,
-        width: 1200,
-        height: 700,
-      };
-    }
-
-    const minX = Math.min(...topology.nodes.map((n) => n.x - 100));
-    const maxX = Math.max(...topology.nodes.map((n) => n.x + 100));
-    const minY = Math.min(...topology.nodes.map((n) => n.y - 36));
-    const maxY = Math.max(...topology.nodes.map((n) => n.y + 36));
-
-    return {
-      minX,
-      minY,
-      maxX,
-      maxY,
-      width: maxX - minX,
-      height: maxY - minY,
-    };
-  }, [topology.nodes]);
-
-  useEffect(() => {
-    const element = mapViewportRef.current;
-    if (!element) return;
-
-    const updateSize = () => {
-      const rect = element.getBoundingClientRect();
-      setMapViewportSize({
-        width: Math.max(320, Math.round(rect.width)),
-        height: Math.max(280, Math.round(rect.height)),
-      });
-    };
-
-    updateSize();
-
-    const observer = new ResizeObserver(() => updateSize());
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, []);
-
-  const fitMapToViewport = useCallback(() => {
-    const pad = 70;
-    const fitScale = Math.min(
-      (mapViewportSize.width - pad * 2) / Math.max(topologyBounds.width, 1),
-      (mapViewportSize.height - pad * 2) / Math.max(topologyBounds.height, 1),
-    );
-    const scale = Math.max(0.85, Math.min(MAX_SCALE, fitScale));
-    const x =
-      mapViewportSize.width / 2 -
-      (topologyBounds.minX + topologyBounds.width / 2) * scale;
-    const y =
-      mapViewportSize.height / 2 -
-      (topologyBounds.minY + topologyBounds.height / 2) * scale;
-
-    setViewport({ x, y, scale });
-  }, [mapViewportSize.height, mapViewportSize.width, topologyBounds]);
-
-  useEffect(() => {
-    if (mapInitializedRef.current || topology.nodes.length === 0) return;
-    fitMapToViewport();
-    mapInitializedRef.current = true;
-  }, [topology.nodes.length, fitMapToViewport]);
-
-  useEffect(() => {
-    const html = document.documentElement;
-    const body = document.body;
-    const prevHtmlOX = html.style.overscrollBehaviorX;
-    const prevHtmlOY = html.style.overscrollBehaviorY;
-    const prevBodyOX = body.style.overscrollBehaviorX;
-    const prevBodyOY = body.style.overscrollBehaviorY;
-    const prevBodyOF = body.style.overflow;
-
-    html.style.overscrollBehaviorX = "none";
-    html.style.overscrollBehaviorY = "none";
-    body.style.overscrollBehaviorX = "none";
-    body.style.overscrollBehaviorY = "none";
-    body.style.overflow = "hidden";
-
-    return () => {
-      html.style.overscrollBehaviorX = prevHtmlOX;
-      html.style.overscrollBehaviorY = prevHtmlOY;
-      body.style.overscrollBehaviorX = prevBodyOX;
-      body.style.overscrollBehaviorY = prevBodyOY;
-      body.style.overflow = prevBodyOF;
-    };
-  }, []);
-
-  useEffect(() => {
-    const element = mapViewportRef.current;
-    if (!element) return;
-
-    const zoomAtPoint = (clientX: number, clientY: number, ratio: number) => {
-      const rect = element.getBoundingClientRect();
-      const centerX = clientX - rect.left;
-      const centerY = clientY - rect.top;
-
-      setViewport((prev) => {
-        const nextScale = Math.max(
-          MIN_SCALE,
-          Math.min(MAX_SCALE, prev.scale * ratio),
-        );
-        if (nextScale === prev.scale) return prev;
-        const worldX = (centerX - prev.x) / prev.scale;
-        const worldY = (centerY - prev.y) / prev.scale;
-        return {
-          x: centerX - worldX * nextScale,
-          y: centerY - worldY * nextScale,
-          scale: nextScale,
-        };
-      });
-    };
-
-    const handleWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      const isZoom = e.ctrlKey || e.metaKey;
-      if (isZoom) {
-        const ratio = e.deltaY > 0 ? 0.94 : 1.06;
-        zoomAtPoint(e.clientX, e.clientY, ratio);
-      } else {
-        setViewport((prev) => ({
-          ...prev,
-          x: prev.x - e.deltaX,
-          y: prev.y - e.deltaY,
-        }));
-      }
-    };
-
-    const handleGStart = (e: any) => {
-      e.preventDefault();
-      safariGestureScaleRef.current = e.scale || 1;
-    };
-
-    const handleGChange = (e: any) => {
-      e.preventDefault();
-      const scale = e.scale || 1;
-      const ratio = scale / Math.max(safariGestureScaleRef.current, 0.001);
-      safariGestureScaleRef.current = scale;
-      if (ratio !== 1) {
-        const rect = element.getBoundingClientRect();
-        zoomAtPoint(
-          e.clientX ?? rect.left + rect.width / 2,
-          e.clientY ?? rect.top + rect.height / 2,
-          ratio,
-        );
-      }
-    };
-
-    const handleGEnd = (e: any) => e.preventDefault();
-    const handleTouchMove = (e: TouchEvent) => e.preventDefault();
-
-    element.addEventListener("wheel", handleWheel, { passive: false });
-    element.addEventListener("gesturestart", handleGStart, { passive: false });
-    element.addEventListener("gesturechange", handleGChange, {
-      passive: false,
-    });
-    element.addEventListener("gestureend", handleGEnd, { passive: false });
-    element.addEventListener("touchmove", handleTouchMove, { passive: false });
-
-    return () => {
-      element.removeEventListener("wheel", handleWheel);
-      element.removeEventListener("gesturestart", handleGStart);
-      element.removeEventListener("gesturechange", handleGChange);
-      element.removeEventListener("gestureend", handleGEnd);
-      element.removeEventListener("touchmove", handleTouchMove);
-    };
-  }, [loading, containers.length]);
-
-  const handleMapMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
-    if (e.target === e.currentTarget) {
-      setSelectedNodeId(null);
-    }
-    panStateRef.current = {
-      active: true,
-      moved: false,
-      pointerStartX: e.clientX,
-      pointerStartY: e.clientY,
-      viewportStartX: viewport.x,
-      viewportStartY: viewport.y,
-    };
-    setIsPanning(true);
-  };
-
-  const handleMapMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
-    if (!panStateRef.current.active) return;
-    const dx = e.clientX - panStateRef.current.pointerStartX;
-    const dy = e.clientY - panStateRef.current.pointerStartY;
-
-    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
-      panStateRef.current.moved = true;
-    }
-
-    setViewport((prev) => ({
-      ...prev,
-      x: panStateRef.current.viewportStartX + dx,
-      y: panStateRef.current.viewportStartY + dy,
-    }));
-  };
-
-  const handleMapTouchStart = (e: React.TouchEvent<SVGSVGElement>) => {
-    if (e.touches.length !== 1) return;
-    const touch = e.touches[0];
-
-    if (e.target === e.currentTarget) {
-      setSelectedNodeId(null);
-    }
-    panStateRef.current = {
-      active: true,
-      moved: false,
-      pointerStartX: touch.clientX,
-      pointerStartY: touch.clientY,
-      viewportStartX: viewport.x,
-      viewportStartY: viewport.y,
-    };
-    setIsPanning(true);
-  };
-
-  const handleMapTouchMove = (e: React.TouchEvent<SVGSVGElement>) => {
-    if (!panStateRef.current.active || e.touches.length !== 1) return;
-    const touch = e.touches[0];
-    const dx = touch.clientX - panStateRef.current.pointerStartX;
-    const dy = touch.clientY - panStateRef.current.pointerStartY;
-
-    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
-      panStateRef.current.moved = true;
-    }
-
-    setViewport((prev) => ({
-      ...prev,
-      x: panStateRef.current.viewportStartX + dx,
-      y: panStateRef.current.viewportStartY + dy,
-    }));
-  };
-
-  const endMapPan = () => {
-    panStateRef.current.active = false;
-    setIsPanning(false);
-  };
 
   const highlightedGraph = useMemo(() => {
     if (!selectedNodeId) {
@@ -1182,55 +1555,163 @@ export default function Containers() {
     return { nodeIds, edgeIds };
   }, [selectedNodeId, topology.edges]);
 
-  const proxyRouteBundle = useMemo(() => {
-    const proxyNode = nodeById["service:proxy"];
-    if (!proxyNode) return null;
-    const containerAnchorOffsetY = -16;
+  const fitMapToViewport = useCallback(() => {
+    if (!reactFlowInstance) return;
+    void reactFlowInstance.fitView({
+      padding: 0.18,
+      duration: 400,
+      minZoom: 0.85,
+      maxZoom: MAX_SCALE,
+    });
+  }, [reactFlowInstance]);
 
-    const bundledRoutes = topology.edges
-      .filter(
-        (edge) =>
-          edge.kind === "route" &&
-          edge.source === "service:proxy" &&
-          edge.target.startsWith("container:"),
-      )
-      .map((edge) => ({ edgeId: edge.id, node: nodeById[edge.target] }))
-      .filter((item): item is { edgeId: string; node: GraphNode } =>
-        Boolean(item.node),
-      )
-      .map((item) => ({
-        ...item,
-        routeY: item.node.y + containerAnchorOffsetY,
-      }));
+  useEffect(() => {
+    if (
+      !reactFlowInstance ||
+      mapInitializedRef.current ||
+      topology.nodes.length === 0
+    ) {
+      return;
+    }
+    fitMapToViewport();
+    mapInitializedRef.current = true;
+  }, [fitMapToViewport, reactFlowInstance, topology.nodes.length]);
 
-    if (bundledRoutes.length === 0) return null;
+  const handleNodeOpen = useCallback(
+    (node: GraphNode, containerMatch?: ContainerInfo) => {
+      if (node.kind === "container" && containerMatch) {
+        setSelectedContainer(containerMatch);
+        return;
+      }
+      if (node.kind === "project") {
+        if (node.label.toLowerCase() === "baseful") {
+          setBasefulUsersDrawerOpen(true);
+          return;
+        }
+        const project = Object.values(projectsById).find(
+          (p) => (p as any).name === node.label,
+        );
+        if (project) {
+          setSelectedManageProject(project as any);
+          setManageProjectDialogOpen(true);
+        }
+      }
+    },
+    [projectsById],
+  );
 
-    const proxyConnectorX = proxyNode.x + 110;
-    const nearestTargetConnectorX = Math.min(
-      ...bundledRoutes.map((item) => item.node.x - 110),
-    );
-    const rawTrunkX =
-      proxyConnectorX + (nearestTargetConnectorX - proxyConnectorX) * 0.8;
-    // Keep the vertical trunk outside container cards to avoid lines crossing cards.
-    const trunkX = Math.round(Math.min(rawTrunkX, nearestTargetConnectorX - 24));
-    const trunkMinY = Math.min(
-      proxyNode.y,
-      ...bundledRoutes.map((item) => item.routeY),
-    );
-    const trunkMaxY = Math.max(
-      proxyNode.y,
-      ...bundledRoutes.map((item) => item.routeY),
-    );
+  const flowNodes = useMemo<TopologyFlowNode[]>(
+    () =>
+      topology.nodes.map((node) => {
+        const isContainer = node.kind === "container";
+        const containerMatch =
+          isContainer && node.containerId
+            ? containers.find((c) => c.id === node.containerId)
+            : undefined;
+        const { width, height } = getNodeCardDimensions(node);
+        const hasIncoming = topology.edges.some(
+          (edge) => edge.target === node.id,
+        );
+        const hasOutgoing = topology.edges.some(
+          (edge) => edge.source === node.id,
+        );
 
-    return {
-      proxyNode,
-      proxyConnectorX,
-      trunkX,
-      trunkMinY,
-      trunkMaxY,
-      bundledRoutes,
-    };
-  }, [nodeById, topology.edges]);
+        return {
+          id: node.id,
+          type: "topologyNode",
+          position: {
+            x: node.x - width / 2,
+            y: node.y - height / 2,
+          },
+          draggable: false,
+          selectable: true,
+          sourcePosition: Position.Right,
+          targetPosition: Position.Left,
+          data: {
+            node,
+            isSelected: selectedNodeId === node.id,
+            isRelated: highlightedGraph.nodeIds.has(node.id),
+            outboundRouteCount: topology.edges.filter(
+              (edge) => edge.source === node.id && edge.kind === "route",
+            ).length,
+            hasIncoming,
+            hasOutgoing,
+            containerMatch,
+            actionLoading: containerActionLoading[node.containerId || node.id],
+            isAdmin: Boolean(user?.isAdmin),
+            onSelect: setSelectedNodeId,
+            onOpen: handleNodeOpen,
+            onOpenLogs: (container) => {
+              void openContainerLogs(container);
+            },
+            onContainerAction: (container, action) => {
+              setPendingContainerAction({ container, action });
+            },
+            onOpenProxyLogs: () => {
+              void openProxyLogs();
+            },
+          },
+        };
+      }),
+    [
+      topology.nodes,
+      topology.edges,
+      containers,
+      selectedNodeId,
+      highlightedGraph.nodeIds,
+      containerActionLoading,
+      user?.isAdmin,
+      handleNodeOpen,
+      openContainerLogs,
+      openProxyLogs,
+    ],
+  );
+
+  const flowEdges = useMemo<TopologyFlowEdge[]>(
+    () =>
+      topology.edges.map((edge) => {
+        const isRelated = highlightedGraph.edgeIds.has(edge.id);
+        const isRoute = edge.kind === "route";
+        const neutralStroke = isRelated ? "#6b7280" : "#3f3f46";
+        return {
+          id: edge.id,
+          source: edge.source,
+          target: edge.target,
+          sourceHandle:
+            edge.kind === "route" && edge.source === "service:proxy"
+              ? "source-route"
+              : "source-main",
+          targetHandle:
+            edge.kind === "route" && edge.target.startsWith("container:")
+              ? "target-route"
+              : "target-main",
+          type:
+            edge.kind === "route" && edge.source === "service:proxy"
+              ? "proxyRoute"
+              : "smoothstep",
+          animated: false,
+          selectable: false,
+          interactionWidth: 0,
+          markerEnd: undefined,
+          style: {
+            stroke: neutralStroke,
+            strokeOpacity: isRelated ? 1 : 0.4,
+            strokeWidth: isRoute
+              ? isRelated
+                ? 1.6
+                : 1.2
+              : isRelated
+                ? 2
+                : 1.5,
+            strokeDasharray: isRoute ? "4 6" : undefined,
+          },
+        };
+      }),
+    [highlightedGraph.edgeIds, topology.edges],
+  );
+
+  const nodeTypes = useMemo(() => ({ topologyNode: TopologyNodeCard }), []);
+  const edgeTypes = useMemo(() => ({ proxyRoute: ProxyRouteEdge }), []);
 
   const renderTerminalDialogContent = () => (
     <DialogContent className="sm:max-w-[85vw] w-full h-[85vh] flex flex-col p-0 gap-0 bg-[#0c0c0c] border-neutral-800 text-neutral-200 shadow-2xl overflow-hidden focus:outline-none">
@@ -1271,8 +1752,17 @@ export default function Containers() {
         className="flex-1 bg-[#0c0c0c] p-5 font-mono text-xs md:text-sm overflow-y-auto overflow-x-auto scrollbar-thin scrollbar-thumb-neutral-800"
       >
         <div className="flex flex-col gap-1.5">
-          {terminalOutput.map((line, i) => {
+          {renderedTerminalOutput.hiddenCount > 0 && (
+            <div className="text-[10px] uppercase tracking-wide text-neutral-500 pb-2">
+              Showing last {MAX_RENDERED_TERMINAL_LINES} entries (
+              {renderedTerminalOutput.hiddenCount} hidden)
+            </div>
+          )}
+          {renderedTerminalOutput.lines.map((line, i) => {
             const isCommand = line.includes("] > ");
+            const [cwdPart, commandPart] = isCommand
+              ? line.split("] > ", 2)
+              : ["", ""];
             return (
               <div key={i} className="break-all whitespace-pre-wrap flex gap-2">
                 {isCommand ? (
@@ -1283,13 +1773,11 @@ export default function Containers() {
                       </span>
                       <span className="text-white">:</span>
                       <span className="text-blue-400">
-                        {line.split("] > ")[0].substring(1)}
+                        {cwdPart.substring(1)}
                       </span>
                       <span className="text-white">#</span>
                     </div>
-                    <span className="text-neutral-100">
-                      {line.split("] > ")[1]}
-                    </span>
+                    <span className="text-neutral-100">{commandPart}</span>
                   </div>
                 ) : (
                   <div className="flex flex-col">{parseAnsi(line)}</div>
@@ -1423,754 +1911,56 @@ export default function Containers() {
           </div>
         ) : (
           <div className="relative w-full flex-1 min-h-0">
-            <div
-              ref={mapViewportRef}
-              className={`relative h-full w-full overflow-hidden  bg-transparent overscroll-none select-none ${isPanning ? "cursor-grabbing" : "cursor-grab"}`}
-              style={{ touchAction: "none" }}
-            >
-              <svg
-                width="100%"
-                height="100%"
-                viewBox={`0 0 ${mapViewportSize.width} ${mapViewportSize.height}`}
-                onMouseDown={handleMapMouseDown}
-                onMouseMove={handleMapMouseMove}
-                onMouseUp={endMapPan}
-                onMouseLeave={endMapPan}
-                onTouchStart={handleMapTouchStart}
-                onTouchMove={handleMapTouchMove}
-                onTouchEnd={endMapPan}
-                onTouchCancel={endMapPan}
+            <div className="relative h-full w-full overflow-hidden rounded-xl border border-white/[0.05] bg-transparent">
+              <ReactFlow<TopologyFlowNode, TopologyFlowEdge>
+                nodes={flowNodes}
+                edges={flowEdges}
+                nodeTypes={nodeTypes}
+                edgeTypes={edgeTypes}
+                onInit={(instance) => setReactFlowInstance(instance)}
+                onPaneClick={() => setSelectedNodeId(null)}
+                onNodeClick={
+                  ((_event, node) => {
+                    setSelectedNodeId(node.id);
+                  }) as NodeMouseHandler<TopologyFlowNode>
+                }
+                onViewportChange={setFlowViewport}
+                minZoom={MIN_SCALE}
+                maxZoom={MAX_SCALE}
+                nodesDraggable={false}
+                nodesConnectable={false}
+                elementsSelectable
+                panOnDrag
+                panOnScroll
+                zoomOnScroll={false}
+                zoomOnPinch
+                zoomOnDoubleClick={false}
+                selectionOnDrag={false}
+                connectionLineType={ConnectionLineType.SmoothStep}
+                defaultEdgeOptions={{
+                  type: "smoothstep",
+                  zIndex: 0,
+                  markerEnd: {
+                    type: MarkerType.ArrowClosed,
+                    width: 0,
+                    height: 0,
+                  },
+                }}
+                fitView={false}
+                proOptions={{ hideAttribution: true }}
+                className="bg-transparent"
               >
-                <defs>
-                  <pattern
-                    id="map-dots"
-                    x="0"
-                    y="0"
-                    width="32"
-                    height="32"
-                    patternUnits="userSpaceOnUse"
-                  >
-                    <circle
-                      cx="1"
-                      cy="1"
-                      r="1"
-                      fill="#ffffff"
-                      fillOpacity="0.2"
-                    />
-                  </pattern>
-                  <filter
-                    id="node-shadow"
-                    x="-20%"
-                    y="-20%"
-                    width="140%"
-                    height="140%"
-                  >
-                    <feDropShadow
-                      dx="0"
-                      dy="2"
-                      stdDeviation="2"
-                      floodColor="#000000"
-                      floodOpacity="0.25"
-                    />
-                  </filter>
-                </defs>
+                <Background
+                  id="container-map-dots"
+                  variant={BackgroundVariant.Dots}
+                  gap={32}
+                  size={1.4}
+                  color="rgba(255,255,255,0.18)"
+                />
+              </ReactFlow>
 
-                <g
-                  transform={`translate(${viewport.x}, ${viewport.y}) scale(${viewport.scale})`}
-                >
-                  <rect
-                    x={topologyBounds.minX - 1000}
-                    y={topologyBounds.minY - 1000}
-                    width={topologyBounds.width + 2000}
-                    height={topologyBounds.height + 2000}
-                    fill="url(#map-dots)"
-                  />
-
-                  {topology.edges.map((edge) => {
-                    const source = nodeById[edge.source];
-                    const target = nodeById[edge.target];
-                    if (!source || !target) return null;
-                    if (
-                      edge.kind === "route" &&
-                      edge.source === "service:proxy" &&
-                      edge.target.startsWith("container:")
-                    ) {
-                      return null;
-                    }
-
-                    const isRelated = highlightedGraph.edgeIds.has(edge.id);
-                    const isRoute = edge.kind === "route";
-                    const stroke = isRoute
-                      ? isRelated
-                        ? "#7c8ca3"
-                        : "#5a6678"
-                      : isRelated
-                        ? "#6b7280"
-                        : "#3f3f46";
-                    const opacity = isRoute
-                      ? isRelated
-                        ? 0.8
-                        : 0.45
-                      : isRelated
-                        ? 1
-                        : 0.4;
-                    const width = isRoute
-                      ? isRelated
-                        ? 1.6
-                        : 1.2
-                      : isRelated
-                        ? 2
-                        : 1.5;
-
-                    return (
-                      <line
-                        key={edge.id}
-                        x1={source.x + 110}
-                        y1={source.y}
-                        x2={target.x - 110}
-                        y2={target.y}
-                        stroke={stroke}
-                        strokeOpacity={opacity}
-                        strokeWidth={width}
-                        strokeDasharray={isRoute ? "4 6" : undefined}
-                      />
-                    );
-                  })}
-
-                  {proxyRouteBundle && (
-                    <>
-                      <line
-                        x1={proxyRouteBundle.proxyConnectorX}
-                        y1={proxyRouteBundle.proxyNode.y}
-                        x2={proxyRouteBundle.trunkX}
-                        y2={proxyRouteBundle.proxyNode.y}
-                        stroke={
-                          selectedNodeId === "service:proxy"
-                            ? "#7c8ca3"
-                            : "#5a6678"
-                        }
-                        strokeOpacity={
-                          selectedNodeId === "service:proxy" ? 0.8 : 0.45
-                        }
-                        strokeWidth={
-                          selectedNodeId === "service:proxy" ? 1.6 : 1.2
-                        }
-                        strokeDasharray="4 6"
-                      />
-                      <line
-                        x1={proxyRouteBundle.trunkX}
-                        y1={proxyRouteBundle.trunkMinY}
-                        x2={proxyRouteBundle.trunkX}
-                        y2={proxyRouteBundle.trunkMaxY}
-                        stroke={
-                          selectedNodeId === "service:proxy"
-                            ? "#7c8ca3"
-                            : "#5a6678"
-                        }
-                        strokeOpacity={
-                          selectedNodeId === "service:proxy" ? 0.8 : 0.45
-                        }
-                        strokeWidth={
-                          selectedNodeId === "service:proxy" ? 1.6 : 1.2
-                        }
-                        strokeDasharray="4 6"
-                      />
-                      {proxyRouteBundle.bundledRoutes.map((item) => {
-                        const isRelated =
-                          highlightedGraph.edgeIds.has(item.edgeId) ||
-                          highlightedGraph.nodeIds.has(item.node.id) ||
-                          selectedNodeId === "service:proxy";
-
-                        return (
-                          <line
-                            key={`bundle:${item.edgeId}`}
-                            x1={proxyRouteBundle.trunkX}
-                            y1={item.routeY}
-                            x2={item.node.x - 110}
-                            y2={item.routeY}
-                            stroke={isRelated ? "#7c8ca3" : "#5a6678"}
-                            strokeOpacity={isRelated ? 0.8 : 0.45}
-                            strokeWidth={isRelated ? 1.6 : 1.2}
-                            strokeDasharray="4 6"
-                          />
-                        );
-                      })}
-                    </>
-                  )}
-
-                  {topology.nodes.map((node) => {
-                    const isContainer = node.kind === "container";
-                    const isSelected = selectedNodeId === node.id;
-                    const isRelated = highlightedGraph.nodeIds.has(node.id);
-                    const outboundRouteCount = topology.edges.filter(
-                      (edge) =>
-                        edge.source === node.id && edge.kind === "route",
-                    ).length;
-                    const containerMatch =
-                      isContainer && node.containerId
-                        ? containers.find((c) => c.id === node.containerId)
-                        : undefined;
-                    const cardWidth = node.kind === "internet" ? 232 : 220;
-                    const cardHeight =
-                      node.kind === "internet"
-                        ? 164
-                        : node.kind === "service"
-                          ? 188
-                          : 150;
-
-                    let iconNode = (
-                      <CubeIcon className="w-4 h-4 text-neutral-400" />
-                    );
-                    let nodeTypeStr = "Node";
-
-                    if (node.kind === "project") {
-                      const isBaseful = node.label.toLowerCase() === "baseful";
-                      iconNode = isBaseful ? (
-                        <img
-                          src="/logo.png"
-                          alt="Baseful"
-                          className="w-4 h-4 rounded-sm object-contain"
-                        />
-                      ) : (
-                        <DitherAvatar value={node.label} size={16} />
-                      );
-                      nodeTypeStr = "Project";
-                    } else if (node.kind === "service") {
-                      iconNode = (
-                        <ServiceIconSVG className="w-4 h-4 text-neutral-400" />
-                      );
-                      nodeTypeStr = "Service";
-                    } else if (node.kind === "internet") {
-                      iconNode = (
-                        <GlobeIcon className="w-4 h-4 text-blue-300" />
-                      );
-                      nodeTypeStr = "Internet";
-                    } else if (node.kind === "network") {
-                      iconNode = (
-                        <NetworkIconSVG className="w-4 h-4 text-neutral-400" />
-                      );
-                      nodeTypeStr = "Network";
-                    } else if (isContainer) {
-                      iconNode = node.isSimulated ? (
-                        <CubeIcon className="w-4 h-4 text-amber-300" />
-                      ) : (
-                        <DockerLogoSVG className="w-4 h-4 text-neutral-300" />
-                      );
-                      nodeTypeStr = "Container";
-                    }
-
-                    return (
-                      <g key={node.id} style={{ cursor: "default" }}>
-                        <foreignObject
-                          x={node.x - cardWidth / 2 - 10}
-                          y={node.y - cardHeight / 2 - 10}
-                          width={cardWidth + 20}
-                          height={cardHeight + 20}
-                        >
-                          <div className="w-full h-full p-2.5 flex items-center justify-center">
-                            <div
-                              className={`rounded-[10px] border flex flex-col select-none transition-colors overflow-hidden ${
-                                isSelected
-                                  ? "bg-neutral-800 border-neutral-500 shadow-xl"
-                                  : isRelated
-                                    ? "bg-[#181818] border-neutral-600 shadow-md"
-                                    : "bg-[#121212] border-[#2a2a2a] shadow-md hover:border-[#3e3e3e]"
-                              }`}
-                              style={{ width: cardWidth, height: cardHeight }}
-                              onClick={() => {
-                                if (panStateRef.current.moved) return;
-                                setSelectedNodeId(node.id);
-                              }}
-                            >
-                              <div
-                                className={`flex items-center gap-2.5 px-3 h-[34px] border-b ${
-                                  isSelected
-                                    ? "border-neutral-600"
-                                    : "border-[#2a2a2a]"
-                                }`}
-                              >
-                                <div className="flex-shrink-0 flex items-center justify-center">
-                                  {iconNode}
-                                </div>
-                                <div className="flex items-center gap-1.5 min-w-0 flex-1 justify-between">
-                                  <span className="text-xs font-semibold text-neutral-300 truncate leading-tight">
-                                    {node.label}
-                                  </span>
-                                  <div className="flex items-center gap-1.5 flex-shrink-0">
-                                    {node.kind === "service" && (
-                                      <span
-                                        className={`text-[10px] tracking-tight uppercase font-medium px-1.5 py-0.5 rounded border ${
-                                          node.status?.toLowerCase() ===
-                                          "running"
-                                            ? "text-emerald-300 bg-emerald-500/10 border-emerald-500/30"
-                                            : "text-neutral-300 bg-neutral-700/30 border-neutral-600"
-                                        }`}
-                                      >
-                                        {node.status || "Unknown"}
-                                      </span>
-                                    )}
-                                    {node.version &&
-                                      node.kind !== "service" && (
-                                        <span className="text-[10px] tracking-tight uppercase text-neutral-400 font-medium px-1.5 py-0.5 bg-[#1f1f1f] rounded border border-[#2a2a2a]">
-                                          {node.version}
-                                        </span>
-                                      )}
-                                  </div>
-                                </div>
-                              </div>
-                              <div className="flex-1 flex flex-col px-3 py-2 justify-center">
-                                {isContainer ? (
-                                  <div className="space-y-2.5">
-                                    <div className="flex flex-col gap-0.5">
-                                      <span className="text-[9px] text-neutral-500 font-bold uppercase tracking-widest">
-                                        Internal IP
-                                      </span>
-                                      <span className="text-[10px] text-neutral-300 font-mono bg-neutral-900/50 px-1.5 py-0.5 rounded border border-white/5 w-fit">
-                                        {node.ip || "N/A"}
-                                      </span>
-                                    </div>
-                                    <div className="flex flex-col gap-0.5">
-                                      <span className="text-[9px] text-neutral-500 font-bold uppercase tracking-widest">
-                                        Uptime
-                                      </span>
-                                      <span className="text-[10px] text-neutral-300 truncate leading-tight">
-                                        {node.status?.replace("Up ", "") ||
-                                          "N/A"}
-                                      </span>
-                                    </div>
-                                  </div>
-                                ) : node.kind === "project" ? (
-                                  <div className="space-y-2">
-                                    <span className="text-[9px] text-neutral-500 font-bold uppercase tracking-widest block">
-                                      Project Members
-                                    </span>
-                                    <div className="flex -space-x-1.5 overflow-hidden">
-                                      {(node.users || [])
-                                        .slice(0, 7)
-                                        .map((u, i) => (
-                                          <div
-                                            key={i}
-                                            className="h-6 w-6 rounded-full border-2 border-neutral-700 flex items-center justify-center overflow-hidden bg-muted"
-                                          >
-                                            {u.avatarUrl ? (
-                                              <img
-                                                src={u.avatarUrl}
-                                                className="size-full object-cover"
-                                                alt=""
-                                              />
-                                            ) : (
-                                              <LetterAvatar
-                                                name={u.email}
-                                                size={20}
-                                                className="rounded-full"
-                                              />
-                                            )}
-                                          </div>
-                                        ))}
-                                      {(node.users?.length || 0) > 7 && (
-                                        <div className="inline-flex h-6 min-w-6 px-1 rounded-full border-2 border-neutral-700 items-center justify-center bg-neutral-800 text-[10px] font-semibold text-neutral-200">
-                                          +{(node.users?.length || 0) - 7}
-                                        </div>
-                                      )}
-                                      {(!node.users ||
-                                        node.users.length === 0) && (
-                                        <span className="text-[10px] text-neutral-500 italic">
-                                          No members assigned
-                                        </span>
-                                      )}
-                                    </div>
-                                  </div>
-                                ) : node.kind === "network" ? (
-                                  <div className="space-y-1">
-                                    <span className="text-[9px] text-neutral-500 font-bold uppercase tracking-widest block">
-                                      Network Status
-                                    </span>
-                                    <div className="flex items-center justify-between bg-blue-500/5 border border-blue-500/10 rounded px-2 py-1.5">
-                                      <span className="text-[10px] text-blue-400 font-bold tracking-tight">
-                                        {node.count}{" "}
-                                        {node.count === 1
-                                          ? "Container"
-                                          : "Containers"}{" "}
-                                        Active
-                                      </span>
-                                    </div>
-                                  </div>
-                                ) : node.kind === "service" ? (
-                                  <div className="space-y-2">
-                                    <div className="flex flex-col gap-0.5">
-                                      <span className="text-[9px] text-neutral-500 font-bold uppercase tracking-widest">
-                                        Endpoint
-                                      </span>
-                                      <span className="text-[10px] text-neutral-300 font-mono bg-neutral-900/50 px-1.5 py-0.5 rounded border border-white/5 w-fit max-w-full truncate">
-                                        {node.version || "N/A"}
-                                      </span>
-                                    </div>
-                                    <div className="flex items-center justify-between rounded border border-white/5 bg-neutral-900/40 px-2 py-1">
-                                      <span className="text-[9px] text-neutral-500 font-bold uppercase tracking-wider">
-                                        Active Routes
-                                      </span>
-                                      <span className="text-[10px] text-sky-300 font-semibold">
-                                        {outboundRouteCount}
-                                      </span>
-                                    </div>
-                                    {node.id === "service:proxy" &&
-                                      user?.isAdmin && (
-                                        <button
-                                          type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            void openProxyLogs();
-                                          }}
-                                          className={`h-7 w-full rounded border px-2 text-[10px] uppercase tracking-wider font-semibold transition-colors ${
-                                            containerActionLoading[
-                                              "service:proxy"
-                                            ]
-                                              ? "border-neutral-700 text-neutral-500 cursor-not-allowed"
-                                              : "border-neutral-700 text-neutral-300 hover:bg-neutral-800"
-                                          }`}
-                                          disabled={Boolean(
-                                            containerActionLoading[
-                                              "service:proxy"
-                                            ],
-                                          )}
-                                        >
-                                          View Logs
-                                        </button>
-                                      )}
-                                  </div>
-                                ) : node.kind === "internet" ? (
-                                  <div className="space-y-2.5">
-                                    <div className="flex items-center justify-between rounded border border-sky-500/20 bg-sky-500/5 px-2 py-1.5">
-                                      <span className="text-[9px] text-sky-200 font-bold uppercase tracking-wider">
-                                        Public Entry
-                                      </span>
-                                      <span className="text-[10px] text-sky-300 font-semibold">
-                                        Active
-                                      </span>
-                                    </div>
-                                    <div className="grid grid-cols-2 gap-1.5">
-                                      <div className="rounded border border-white/5 bg-neutral-900/40 px-2 py-1.5">
-                                        <div className="text-[8px] text-neutral-500 font-bold uppercase tracking-wider">
-                                          Protocol
-                                        </div>
-                                        <div className="text-[10px] text-neutral-200 font-mono">
-                                          HTTP(S)
-                                        </div>
-                                      </div>
-                                      <div className="rounded border border-white/5 bg-neutral-900/40 px-2 py-1.5">
-                                        <div className="text-[8px] text-neutral-500 font-bold uppercase tracking-wider">
-                                          Routed To
-                                        </div>
-                                        <div className="text-[10px] text-neutral-200 font-semibold">
-                                          {outboundRouteCount} Service
-                                          {outboundRouteCount === 1 ? "" : "s"}
-                                        </div>
-                                      </div>
-                                    </div>
-                                    <div className="text-[9px] text-neutral-400 leading-tight">
-                                      External traffic enters here before being
-                                      forwarded to the proxy layer.
-                                    </div>
-                                  </div>
-                                ) : (
-                                  node.detail && (
-                                    <span className="text-[11px] text-neutral-400 truncate leading-tight">
-                                      {nodeTypeStr}
-                                    </span>
-                                  )
-                                )}
-                              </div>
-                              {(isContainer || node.kind === "project") && (
-                                <div
-                                  className={`flex items-center justify-end px-3 h-[40px] border-t gap-1 ${
-                                    isSelected
-                                      ? "border-neutral-600"
-                                      : "border-[#2a2a2a]"
-                                  }`}
-                                >
-                                  {isContainer &&
-                                    containerMatch &&
-                                    !node.isSimulated && (
-                                      <>
-                                        <div
-                                          role="button"
-                                          tabIndex={0}
-                                          onClick={(e) => {
-                                            if (
-                                              node.isSimulated ||
-                                              Boolean(
-                                                containerActionLoading[
-                                                  containerMatch.id
-                                                ],
-                                              )
-                                            ) {
-                                              return;
-                                            }
-                                            e.stopPropagation();
-                                            void openContainerLogs(
-                                              containerMatch,
-                                            );
-                                          }}
-                                          onKeyDown={(e) => {
-                                            if (
-                                              e.key === "Enter" ||
-                                              e.key === " "
-                                            ) {
-                                              e.preventDefault();
-                                              if (
-                                                node.isSimulated ||
-                                                Boolean(
-                                                  containerActionLoading[
-                                                    containerMatch.id
-                                                  ],
-                                                )
-                                              ) {
-                                                return;
-                                              }
-                                              void openContainerLogs(
-                                                containerMatch,
-                                              );
-                                            }
-                                          }}
-                                          className={`h-6 min-w-6 px-2 py-0 border rounded-md flex items-center justify-center text-[10px] border-neutral-700 ${
-                                            node.isSimulated ||
-                                            Boolean(
-                                              containerActionLoading[
-                                                containerMatch.id
-                                              ],
-                                            )
-                                              ? "opacity-40 pointer-events-none"
-                                              : "hover:bg-neutral-800 cursor-pointer"
-                                          }`}
-                                          title="View logs"
-                                        >
-                                          <ListBulletsIcon size={12} />
-                                        </div>
-                                        <div
-                                          role="button"
-                                          tabIndex={0}
-                                          onClick={(e) => {
-                                            if (
-                                              node.isSimulated ||
-                                              Boolean(
-                                                containerActionLoading[
-                                                  containerMatch.id
-                                                ],
-                                              )
-                                            ) {
-                                              return;
-                                            }
-                                            e.stopPropagation();
-                                            void handleContainerAction(
-                                              containerMatch,
-                                              containerMatch.state === "running"
-                                                ? "stop"
-                                                : "start",
-                                            );
-                                          }}
-                                          onKeyDown={(e) => {
-                                            if (
-                                              e.key === "Enter" ||
-                                              e.key === " "
-                                            ) {
-                                              e.preventDefault();
-                                              if (
-                                                node.isSimulated ||
-                                                Boolean(
-                                                  containerActionLoading[
-                                                    containerMatch.id
-                                                  ],
-                                                )
-                                              ) {
-                                                return;
-                                              }
-                                              void handleContainerAction(
-                                                containerMatch,
-                                                containerMatch.state ===
-                                                  "running"
-                                                  ? "stop"
-                                                  : "start",
-                                              );
-                                            }
-                                          }}
-                                          className={`h-6 min-w-6 px-2 py-0 border rounded-md flex items-center justify-center text-[10px] border-neutral-700 ${
-                                            node.isSimulated ||
-                                            Boolean(
-                                              containerActionLoading[
-                                                containerMatch.id
-                                              ],
-                                            )
-                                              ? "opacity-40 pointer-events-none"
-                                              : "hover:bg-neutral-800 cursor-pointer"
-                                          }`}
-                                          title={
-                                            containerMatch.state === "running"
-                                              ? "Stop"
-                                              : "Start"
-                                          }
-                                        >
-                                          {containerMatch.state ===
-                                          "running" ? (
-                                            <StopIcon size={12} />
-                                          ) : (
-                                            <PlayIcon size={12} />
-                                          )}
-                                        </div>
-                                        <div
-                                          role="button"
-                                          tabIndex={0}
-                                          onClick={(e) => {
-                                            if (
-                                              node.isSimulated ||
-                                              Boolean(
-                                                containerActionLoading[
-                                                  containerMatch.id
-                                                ],
-                                              )
-                                            ) {
-                                              return;
-                                            }
-                                            e.stopPropagation();
-                                            void handleContainerAction(
-                                              containerMatch,
-                                              "restart",
-                                            );
-                                          }}
-                                          onKeyDown={(e) => {
-                                            if (
-                                              e.key === "Enter" ||
-                                              e.key === " "
-                                            ) {
-                                              e.preventDefault();
-                                              if (
-                                                node.isSimulated ||
-                                                Boolean(
-                                                  containerActionLoading[
-                                                    containerMatch.id
-                                                  ],
-                                                )
-                                              ) {
-                                                return;
-                                              }
-                                              void handleContainerAction(
-                                                containerMatch,
-                                                "restart",
-                                              );
-                                            }
-                                          }}
-                                          className={`h-6 min-w-6 px-2 py-0 border rounded-md flex items-center justify-center text-[10px] border-neutral-700 ${
-                                            node.isSimulated ||
-                                            Boolean(
-                                              containerActionLoading[
-                                                containerMatch.id
-                                              ],
-                                            )
-                                              ? "opacity-40 pointer-events-none"
-                                              : "hover:bg-neutral-800 cursor-pointer"
-                                          }`}
-                                          title="Restart"
-                                        >
-                                          <ArrowClockwiseIcon size={12} />
-                                        </div>
-                                      </>
-                                    )}
-                                  <div
-                                    role="button"
-                                    tabIndex={0}
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      setSelectedNodeId(node.id); // Also highlight when opening drawer
-                                      if (panStateRef.current.moved) return;
-                                      if (isContainer && containerMatch) {
-                                        setSelectedContainer(containerMatch);
-                                      } else if (node.kind === "project") {
-                                        if (
-                                          node.label.toLowerCase() === "baseful"
-                                        ) {
-                                          setBasefulUsersDrawerOpen(true);
-                                          return;
-                                        }
-                                        const p = Object.values(
-                                          projectsById,
-                                        ).find(
-                                          (p) => (p as any).name === node.label,
-                                        );
-                                        if (p) {
-                                          setSelectedManageProject(p as any);
-                                          setManageProjectDialogOpen(true);
-                                        }
-                                      }
-                                    }}
-                                    onKeyDown={(e) => {
-                                      if (e.key === "Enter" || e.key === " ") {
-                                        e.preventDefault();
-                                        setSelectedNodeId(node.id);
-                                      }
-                                    }}
-                                    className="h-6 min-w-6 px-2 py-0 uppercase tracking-wider font-bold border border-neutral-700 rounded-md hover:bg-neutral-800 cursor-pointer flex items-center justify-center text-[10px]"
-                                  >
-                                    Open
-                                  </div>
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        </foreignObject>
-                      </g>
-                    );
-                  })}
-                </g>
-              </svg>
-
-              <ManageProjectDialog
-                open={manageProjectDialogOpen}
-                onOpenChange={setManageProjectDialogOpen}
-                project={selectedManageProject}
-                onProjectUpdated={fetchContainers}
-              />
-
-              <Dialog open={logsDialogOpen} onOpenChange={setLogsDialogOpen}>
-                <DialogContent className="sm:max-w-[85vw] w-full h-[75vh] flex flex-col p-0 gap-0 bg-[#0c0c0c] border-neutral-800 text-neutral-200 overflow-hidden">
-                  <DialogHeader className="px-4 py-3 border-b border-neutral-800 bg-neutral-900/50">
-                    <DialogTitle className="text-sm font-medium font-mono text-neutral-300">
-                      Logs: {logsContainerName || "Container"}
-                    </DialogTitle>
-                  </DialogHeader>
-                  <div className="flex-1 overflow-auto p-4 font-mono text-xs whitespace-pre-wrap text-neutral-300">
-                    {logsLoading
-                      ? "Loading logs..."
-                      : logsContent || "No log output."}
-                  </div>
-                </DialogContent>
-              </Dialog>
-
-              <Drawer
-                open={basefulUsersDrawerOpen}
-                onOpenChange={setBasefulUsersDrawerOpen}
-                direction={isMobileDrawer ? "bottom" : "right"}
-              >
-                <DrawerContent
-                  className={
-                    isMobileDrawer
-                      ? "h-[88vh] !max-h-none w-full bg-card border-t border-border rounded-none"
-                      : "h-full !w-[92vw] sm:!w-[820px] sm:!max-w-[820px] !max-w-[92vw] bg-card border-l border-border rounded-none"
-                  }
-                >
-                  <DrawerHeader>
-                    <DrawerTitle>Baseful Users & Whitelist</DrawerTitle>
-                    <DrawerDescription>
-                      Manage signed-up users, project access, permissions, and
-                      whitelist.
-                    </DrawerDescription>
-                  </DrawerHeader>
-                  <div className="flex-1 min-h-0">
-                    <UserManagementPanel showHeader={false} />
-                  </div>
-                </DrawerContent>
-              </Drawer>
-
-              <div className="absolute top-3 right-3 flex items-center gap-2 text-sm text-neutral-300 bg-card border border-white/10 rounded-md pl-2 pr-1 py-1">
-                <span>{Math.round(viewport.scale * 100)}%</span>
+              <div className="absolute top-3 right-3 z-20 flex items-center gap-2 text-sm text-neutral-300 bg-card border border-white/10 rounded-md pl-2 pr-1 py-1">
+                <span>{Math.round(flowViewport.zoom * 100)}%</span>
                 <Button
                   variant="outline"
                   size="sm"
@@ -2180,65 +1970,183 @@ export default function Containers() {
                   Reset View
                 </Button>
               </div>
+            </div>
 
-              <Drawer
-                open={!!selectedContainer}
-                onOpenChange={(open: boolean) =>
-                  !open && setSelectedContainer(null)
-                }
-                direction={isMobileDrawer ? "bottom" : "right"}
-              >
-                <DrawerContent
-                  className={
-                    isMobileDrawer
-                      ? "h-[82vh] !max-h-none bg-card border-t border-border rounded-none"
-                      : "h-full bg-card border-l border-border rounded-none"
-                  }
+            <ManageProjectDialog
+              open={manageProjectDialogOpen}
+              onOpenChange={setManageProjectDialogOpen}
+              project={selectedManageProject}
+              onProjectUpdated={fetchContainers}
+            />
+
+            <Dialog open={logsDialogOpen} onOpenChange={setLogsDialogOpen}>
+              <DialogContent className="sm:max-w-[85vw] w-full h-[75vh] flex flex-col p-0 gap-0 bg-[#0c0c0c] border-neutral-800 text-neutral-200 overflow-hidden">
+                <DialogHeader className="px-4 py-3 border-b border-neutral-800 bg-neutral-900/50">
+                  <DialogTitle className="text-sm font-medium font-mono text-neutral-300">
+                    Logs: {logsContainerName || "Container"}
+                  </DialogTitle>
+                </DialogHeader>
+                <div
+                  ref={logsScrollRef}
+                  className="flex-1 overflow-auto p-4 font-mono text-xs text-neutral-300"
                 >
-                  {selectedContainer && (
-                    <>
-                      <DrawerHeader>
-                        <DrawerTitle>
-                          {getContainerDisplayNames(selectedContainer).clean}
-                        </DrawerTitle>
-                        <DrawerDescription className="font-mono text-[11px] truncate">
-                          {getContainerDisplayNames(selectedContainer).full}
-                        </DrawerDescription>
-                      </DrawerHeader>
-                      <div className="flex-1 min-h-0 overflow-y-auto space-y-6 p-4">
-                        <div className="space-y-2">
-                          <label className="text-xs uppercase tracking-wider text-neutral-500">
-                            Image
-                          </label>
-                          <div className="text-xs font-mono bg-neutral-900 border border-neutral-800 p-2 rounded break-all">
-                            {selectedContainer.image}
-                          </div>
+                  {logsLoading ? (
+                    "Loading logs..."
+                  ) : renderedLogsContent.text ? (
+                    <div className="whitespace-pre-wrap break-all">
+                      {renderedLogsContent.hiddenChars > 0 && (
+                        <div className="text-[10px] uppercase tracking-wide text-neutral-500 pb-2">
+                          Showing last {MAX_RENDERED_LOG_CHARS.toLocaleString()}{" "}
+                          characters (
+                          {renderedLogsContent.hiddenChars.toLocaleString()}{" "}
+                          hidden)
                         </div>
-
-                        <div className="flex flex-wrap gap-2">
-                          <Badge variant="secondary">
-                            {selectedContainer.state}
-                          </Badge>
-                          <Badge variant="outline">
-                            {selectedContainer.ip || "No IP"}
-                          </Badge>
-                          <Badge variant="outline">
-                            {inferProjectName(
-                              selectedContainer.labels,
-                              projectsById,
+                      )}
+                      {renderedLogLines.hiddenLineCount > 0 && (
+                        <div className="text-[10px] uppercase tracking-wide text-neutral-500 pb-2">
+                          Showing last {MAX_RENDERED_LOG_LINES.toLocaleString()}{" "}
+                          lines (
+                          {renderedLogLines.hiddenLineCount.toLocaleString()}{" "}
+                          hidden)
+                        </div>
+                      )}
+                      {renderedLogLines.lines.map((line, i) => {
+                        const { prefix, body } = splitDockerLogLine(line);
+                        const level = classifyLogLine(body || line);
+                        return (
+                          <div key={i} className={getLogLevelClass(level)}>
+                            {prefix ? (
+                              <>
+                                <span className="text-neutral-500">
+                                  {prefix}
+                                </span>{" "}
+                                <span>{body}</span>
+                              </>
+                            ) : (
+                              line
                             )}
-                          </Badge>
-                        </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    "No log output."
+                  )}
+                </div>
+              </DialogContent>
+            </Dialog>
 
-                        <div className="pt-4">
-                          {renderTerminalTrigger(selectedContainer, "button")}
+              <ConfirmDialog
+                open={Boolean(pendingContainerAction)}
+                onOpenChange={(open) => {
+                  if (!open) setPendingContainerAction(null);
+                }}
+                title={pendingActionTitle}
+                description={pendingActionDescription}
+                onConfirm={() => void confirmContainerAction()}
+                confirmText={
+                  pendingContainerAction?.action === "restart"
+                  ? "Restart"
+                  : pendingContainerAction?.action === "stop"
+                    ? "Stop"
+                    : "Start"
+              }
+              confirmVariant={
+                pendingContainerAction?.action === "start"
+                  ? "default"
+                  : "destructive"
+              }
+              loading={
+                pendingContainerAction
+                  ? containerActionLoading[
+                      pendingContainerAction.container.id
+                    ] === pendingContainerAction.action
+                  : false
+              }
+            />
+
+            <Drawer
+              open={basefulUsersDrawerOpen}
+              onOpenChange={setBasefulUsersDrawerOpen}
+              direction={isMobileDrawer ? "bottom" : "right"}
+            >
+              <DrawerContent
+                className={
+                  isMobileDrawer
+                    ? "h-[88vh] !max-h-none w-full bg-card border-t border-border rounded-none"
+                    : "h-full !w-[92vw] sm:!w-[820px] sm:!max-w-[820px] !max-w-[92vw] bg-card border-l border-border rounded-none"
+                }
+              >
+                <DrawerHeader>
+                  <DrawerTitle>Baseful Users & Whitelist</DrawerTitle>
+                  <DrawerDescription>
+                    Manage signed-up users, project access, permissions, and
+                    whitelist.
+                  </DrawerDescription>
+                </DrawerHeader>
+                <div className="flex-1 min-h-0">
+                  <UserManagementPanel showHeader={false} />
+                </div>
+              </DrawerContent>
+            </Drawer>
+
+            <Drawer
+              open={!!selectedContainer}
+              onOpenChange={(open: boolean) =>
+                !open && setSelectedContainer(null)
+              }
+              direction={isMobileDrawer ? "bottom" : "right"}
+            >
+              <DrawerContent
+                className={
+                  isMobileDrawer
+                    ? "h-[82vh] !max-h-none bg-card border-t border-border rounded-none"
+                    : "h-full bg-card border-l border-border rounded-none"
+                }
+              >
+                {selectedContainer && (
+                  <>
+                    <DrawerHeader>
+                      <DrawerTitle>
+                        {getContainerDisplayNames(selectedContainer).clean}
+                      </DrawerTitle>
+                      <DrawerDescription className="font-mono text-[11px] truncate">
+                        {getContainerDisplayNames(selectedContainer).full}
+                      </DrawerDescription>
+                    </DrawerHeader>
+                    <div className="flex-1 min-h-0 overflow-y-auto space-y-6 p-4">
+                      <div className="space-y-2">
+                        <label className="text-xs uppercase tracking-wider text-neutral-500">
+                          Image
+                        </label>
+                        <div className="text-xs font-mono bg-neutral-900 border border-neutral-800 p-2 rounded break-all">
+                          {selectedContainer.image}
                         </div>
                       </div>
-                    </>
-                  )}
-                </DrawerContent>
-              </Drawer>
-            </div>
+
+                      <div className="flex flex-wrap gap-2">
+                        <Badge variant="secondary">
+                          {selectedContainer.state}
+                        </Badge>
+                        <Badge variant="outline">
+                          {selectedContainer.ip || "No IP"}
+                        </Badge>
+                        <Badge variant="outline">
+                          {inferProjectName(
+                            selectedContainer.labels,
+                            projectsById,
+                          )}
+                        </Badge>
+                      </div>
+
+                      <div className="pt-4">
+                        {renderTerminalTrigger(selectedContainer, "button")}
+                      </div>
+                    </div>
+                  </>
+                )}
+              </DrawerContent>
+            </Drawer>
           </div>
         )}
       </div>

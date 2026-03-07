@@ -109,6 +109,16 @@ func sanitizeProxyLogLine(line string) string {
 	return sanitized
 }
 
+func getClientProxyHost() string {
+	proxyHost := auth.GetProxyHost()
+	if proxyHost == "localhost" || proxyHost == "0.0.0.0" {
+		if publicIP, err := system.GetPublicIP(); err == nil {
+			return publicIP
+		}
+	}
+	return proxyHost
+}
+
 func readProxyLogTail(logPath string, tail int) ([]string, error) {
 	file, err := os.Open(logPath)
 	if err != nil {
@@ -4408,7 +4418,7 @@ func main() {
 		c.JSON(200, gin.H{
 			"running": true,
 			"port":    auth.GetProxyPort(),
-			"host":    auth.GetProxyHost(),
+			"host":    getClientProxyHost(),
 		})
 	})
 

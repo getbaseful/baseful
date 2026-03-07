@@ -7,7 +7,7 @@ import {
   ClockCounterClockwiseIcon,
   GearSixIcon,
   GraphIcon,
-  CubeIcon,
+  CubeTransparentIcon,
   ListIcon,
   XIcon,
   CaretDownIcon,
@@ -16,6 +16,9 @@ import {
   Globe,
   BellSimpleIcon,
   CaretUpIcon,
+  SirenIcon,
+  LockIcon,
+  UsersIcon,
 } from "@phosphor-icons/react";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
 import { useDatabase } from "@/context/DatabaseContext";
@@ -28,7 +31,7 @@ import { useAuth } from "@/context/AuthContext";
 export default function MobileDock() {
   const { selectedDatabase, databases, refreshDatabases } = useDatabase();
   const { projects, refreshProjects } = useProject();
-  const { hasPermission } = useAuth();
+  const { user, hasPermission } = useAuth();
   const location = useLocation();
   const [isExpanded, setIsExpanded] = useState(false);
   const [createMenuOpen, setCreateMenuOpen] = useState(false);
@@ -77,9 +80,12 @@ export default function MobileDock() {
       lastScrollY.current = currentScrollY;
     };
 
-    // Use capture: true to catch scroll events from ANY nested element 
+    // Use capture: true to catch scroll events from ANY nested element
     // since scroll events do not bubble.
-    window.addEventListener("scroll", handleScroll, { capture: true, passive: true });
+    window.addEventListener("scroll", handleScroll, {
+      capture: true,
+      passive: true,
+    });
 
     return () => {
       window.removeEventListener("scroll", handleScroll, { capture: true });
@@ -115,79 +121,120 @@ export default function MobileDock() {
     return text;
   };
 
+  const getDatabaseSwitchPath = (nextDatabaseId: number) => {
+    const pathParts = location.pathname.split("/");
+    const dbIdIndex = pathParts.indexOf("db");
+
+    if (dbIdIndex !== -1 && pathParts[dbIdIndex + 1]) {
+      pathParts[dbIdIndex + 1] = String(nextDatabaseId);
+      return `${pathParts.join("/")}${location.search}${location.hash}`;
+    }
+
+    if (location.pathname !== "/") {
+      return `${location.pathname}${location.search}${location.hash}`;
+    }
+
+    return `/db/${nextDatabaseId}/dashboard`;
+  };
+
   const navItems = selectedDatabase
     ? [
-      {
-        section: "DATABASE",
-        items: [
-          {
-            name: "Dashboard",
-            icon: HouseIcon,
-            path: `/db/${selectedDatabase.id}/dashboard`,
-          },
-          {
-            name: "Tables",
-            icon: TableIcon,
-            path: `/db/${selectedDatabase.id}/tables`,
-          },
-          {
-            name: "SQL Editor",
-            icon: TerminalIcon,
-            path: `/db/${selectedDatabase.id}/sql-editor`,
-          },
-          {
-            name: "Backup",
-            icon: ClockCounterClockwiseIcon,
-            path: `/db/${selectedDatabase.id}/backup`,
-          },
-          ...(canManageNotifications
-            ? [{
-              name: "DB Alerts",
-              icon: BellSimpleIcon,
-              path: `/db/${selectedDatabase.id}/notifications`,
-            }]
-            : []),
-          {
-            name: "Settings",
-            icon: GearSixIcon,
-            path: `/db/${selectedDatabase.id}/settings`,
-          },
-        ],
-      },
-      ...((canAccessServer || canManageNotifications)
-        ? [{
-          section: "SERVER",
+        {
+          section: "DATABASE",
           items: [
-            ...(canAccessServer
-              ? [{
-                name: "Monitoring",
-                icon: GraphIcon,
-                path: `/monitoring`,
-              }, {
-                name: "Containers",
-                icon: CubeIcon,
-                path: `/containers`,
-              }, {
-                name: "Web Server",
-                icon: Globe,
-                path: `/web-server`,
-              }, {
-                name: "Security",
-                icon: GearSixIcon,
-                path: `/security`,
-              }]
-              : []),
+            {
+              name: "Overview",
+              icon: HouseIcon,
+              path: `/db/${selectedDatabase.id}/dashboard`,
+            },
+            {
+              name: "Tables",
+              icon: TableIcon,
+              path: `/db/${selectedDatabase.id}/tables`,
+            },
+            {
+              name: "SQL Editor",
+              icon: TerminalIcon,
+              path: `/db/${selectedDatabase.id}/sql-editor`,
+            },
+            {
+              name: "Backup",
+              icon: ClockCounterClockwiseIcon,
+              path: `/db/${selectedDatabase.id}/backup`,
+            },
             ...(canManageNotifications
-              ? [{
-                name: "Notification Center",
-                icon: BellSimpleIcon,
-                path: `/notifications`,
-              }]
+              ? [
+                  {
+                    name: "Alerts",
+                    icon: SirenIcon,
+                    path: `/db/${selectedDatabase.id}/notifications`,
+                  },
+                ]
               : []),
+            {
+              name: "Settings",
+              icon: GearSixIcon,
+              path: `/db/${selectedDatabase.id}/settings`,
+            },
           ],
-        }]
-        : []),
-    ]
+        },
+        ...(canAccessServer || canManageNotifications
+          ? [
+              {
+                section: "SERVER",
+                items: [
+                  ...(canAccessServer
+                    ? [
+                        {
+                          name: "Monitoring",
+                          icon: GraphIcon,
+                          path: `/monitoring`,
+                        },
+                        {
+                          name: "Topology",
+                          icon: CubeTransparentIcon,
+                          path: `/containers`,
+                        },
+                        {
+                          name: "Web Server",
+                          icon: Globe,
+                          path: `/web-server`,
+                        },
+                        {
+                          name: "Security",
+                          icon: LockIcon,
+                          path: `/security`,
+                        },
+                      ]
+                    : []),
+                  ...(canManageNotifications
+                    ? [
+                        {
+                          name: "Notification Center",
+                          icon: BellSimpleIcon,
+                          path: `/notifications`,
+                        },
+                      ]
+                    : []),
+                ],
+              },
+            ]
+          : []),
+        ...(user?.isAdmin
+          ? [
+              {
+                section: "ADMIN",
+                items: [
+                  {
+                    name: "Users & Whitelist",
+                    icon: UsersIcon,
+                    path: `/users`,
+                  },
+                ],
+              },
+            ]
+          : []),
+      ]
     : [];
 
   const isActivePath = (path: string) => location.pathname === path;
@@ -215,7 +262,9 @@ export default function MobileDock() {
             </div>
             <Popover open={createMenuOpen} onOpenChange={setCreateMenuOpen}>
               <PopoverTrigger asChild>
-                <div className={`flex-1 bg-muted/50 text-sm  flex items-center gap-2 justify-center rounded-lg text-neutral-400 hover:text-neutral-300 transition-colors duration-200 cursor-pointer active:scale-95 ${!canCreateProjects && !canCreateDatabases ? "opacity-50 pointer-events-none" : ""}`}>
+                <div
+                  className={`flex-1 bg-muted/50 text-sm  flex items-center gap-2 justify-center rounded-lg text-neutral-400 hover:text-neutral-300 transition-colors duration-200 cursor-pointer active:scale-95 ${!canCreateProjects && !canCreateDatabases ? "opacity-50 pointer-events-none" : ""}`}
+                >
                   <PlusIcon size={16} /> Create
                 </div>
               </PopoverTrigger>
@@ -267,10 +316,11 @@ export default function MobileDock() {
                         <Link
                           to={item.path}
                           onClick={() => setIsExpanded(false)}
-                          className={`flex flex-row items-center gap-3 p-2.5 rounded-lg transition-colors ${isActivePath(item.path)
-                            ? "bg-accent text-white"
-                            : "text-neutral-300 hover:bg-muted/50"
-                            }`}
+                          className={`flex flex-row items-center gap-3 p-2.5 rounded-lg transition-colors ${
+                            isActivePath(item.path)
+                              ? "bg-accent text-white"
+                              : "text-neutral-300 hover:bg-muted/50"
+                          }`}
                         >
                           <Icon
                             size={20}
@@ -303,31 +353,39 @@ export default function MobileDock() {
 
       {/* Floating Dock */}
       <div
-        className={`fixed -translate-x-1/2 w-fit transition-all duration-300 left-1/2 right-0 z-50 md:hidden ${isDockVisible ? "bottom-4 translate-y-0" : "bottom-0 translate-y-full"
-          }`}
+        className={`fixed -translate-x-1/2 w-fit transition-all duration-300 left-1/2 right-0 z-50 md:hidden ${
+          isDockVisible ? "bottom-4 translate-y-0" : "bottom-0 translate-y-full"
+        }`}
       >
-        <div className="mx-2 mb-2 bg-card/95 backdrop-blur-lg border border-border rounded-2xl shadow-2xl">
+        <div className="mx-2 mb-2 bg-card border border-border rounded-2xl shadow-2xl">
           <div className="flex flex-row justify-between items-center h-14 px-2 gap-2">
             {/* Database Selector */}
             <Popover open={selectorOpen} onOpenChange={setSelectorOpen}>
               <PopoverTrigger asChild>
                 <div className="flex flex-row items-center gap-2 cursor-pointer p-2 rounded-xl bg-transparent hover:bg-muted transition-colors min-w-0">
-                  <DitherAvatar value={selectedDatabase?.name || "database"} size={32} />
+                  <DitherAvatar
+                    value={selectedDatabase?.name || "database"}
+                    size={32}
+                  />
 
                   <div className="flex flex-col flex-1 min-w-0">
                     <span className="text-sm font-medium truncate">
                       {getSelectorDisplayText()}
                     </span>
                   </div>
-                  {selectorOpen ? <CaretDownIcon
-                    weight="bold"
-                    size={12}
-                    className="text-neutral-400 flex-shrink-0"
-                  /> : <CaretUpIcon
-                    weight="bold"
-                    size={12}
-                    className="text-neutral-400 flex-shrink-0"
-                  />}
+                  {selectorOpen ? (
+                    <CaretDownIcon
+                      weight="bold"
+                      size={12}
+                      className="text-neutral-400 flex-shrink-0"
+                    />
+                  ) : (
+                    <CaretUpIcon
+                      weight="bold"
+                      size={12}
+                      className="text-neutral-400 flex-shrink-0"
+                    />
+                  )}
                 </div>
               </PopoverTrigger>
               <PopoverContent className="w-72 max-h-80 overflow-y-auto p-2 pb-0 pt-4 ml-2">
@@ -353,16 +411,20 @@ export default function MobileDock() {
                                 {dbs.map((db) => (
                                   <li key={db.id}>
                                     <Link
-                                      to={`/db/${db.id}/dashboard`}
+                                      to={getDatabaseSwitchPath(db.id)}
                                       onClick={() => {
                                         setSelectorOpen(false);
                                       }}
-                                      className={`flex flex-row items-center gap-2 p-2 rounded-md transition-colors ${selectedDatabase?.id === db.id
-                                        ? "bg-accent"
-                                        : "hover:bg-accent"
-                                        }`}
+                                      className={`flex flex-row items-center gap-2 p-2 rounded-md transition-colors ${
+                                        selectedDatabase?.id === db.id
+                                          ? "bg-accent"
+                                          : "hover:bg-accent"
+                                      }`}
                                     >
-                                      <DitherAvatar value={db?.name || "database"} size={32} />
+                                      <DitherAvatar
+                                        value={db?.name || "database"}
+                                        size={32}
+                                      />
 
                                       <span className="text-sm text-neutral-200">
                                         {db.name}
