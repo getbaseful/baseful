@@ -45,6 +45,10 @@ interface Database {
   container_id: string;
   token?: string;
   token_expires_at?: string;
+  has_legacy_public_bindings?: boolean;
+  legacy_public_database_binding?: boolean;
+  legacy_public_branch_binding_count?: number;
+  legacy_public_binding_target_count?: number;
 }
 
 interface DatabaseMetrics {
@@ -228,6 +232,7 @@ export default function DatabaseDetail() {
   const [useDomain, setUseDomain] = useState(false);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [confirmRotateTokenOpen, setConfirmRotateTokenOpen] = useState(false);
+  const [confirmSecureLegacyOpen, setConfirmSecureLegacyOpen] = useState(false);
 
   const currentHostname = window.location.hostname;
   const isIP = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(currentHostname);
@@ -343,6 +348,46 @@ export default function DatabaseDetail() {
     }
   };
 
+  const secureLegacyBindings = async () => {
+    setActionLoading("secure-legacy-bindings");
+    try {
+      const res = await authFetch(
+        `/api/databases/${id}/secure-legacy-bindings`,
+        token,
+        { method: "POST" },
+        logout,
+      );
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(
+          data?.error ||
+            data?.message ||
+            "Failed to secure legacy database bindings",
+        );
+      }
+
+      if (Array.isArray(data?.failures) && data.failures.length > 0) {
+        toast.success(
+          `${data.message} ${data.failures.length} target(s) still need manual retry.`,
+        );
+      } else {
+        toast.success(data?.message || "Legacy bindings secured");
+      }
+
+      await refetchDatabase();
+      refreshDatabases();
+    } catch (err: unknown) {
+      toast.error(
+        err instanceof Error
+          ? err.message
+          : "Failed to secure legacy database bindings",
+      );
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
   const getStatusColor = (status: string) => {
     switch (status) {
       case "active":
@@ -440,6 +485,11 @@ export default function DatabaseDetail() {
                   >
                     {database?.status}
                   </div>
+                  {database?.has_legacy_public_bindings && (
+                    <div className="bg-amber-500/10 text-amber-300 text-xs uppercase h-fit w-fit px-2 py-1 rounded-sm">
+                      Legacy Public Port
+                    </div>
+                  )}
                 </>
               )}
             </div>
@@ -496,6 +546,18 @@ export default function DatabaseDetail() {
                   >
                     {actionLoading === "vacuum" ? "Vacuuming..." : "Vacuum"}
                   </Button>
+                  {database?.has_legacy_public_bindings && (
+                    <Button
+                      onClick={() => setConfirmSecureLegacyOpen(true)}
+                      variant={"secondary"}
+                      className="cursor-pointer"
+                      disabled={actionLoading !== null}
+                    >
+                      {actionLoading === "secure-legacy-bindings"
+                        ? "Securing..."
+                        : "Secure Legacy Ports"}
+                    </Button>
+                  )}
                   <Button
                     onClick={() => setConfirmDeleteOpen(true)}
                     className="cursor-pointer"
@@ -669,6 +731,49 @@ export default function DatabaseDetail() {
           setConfirmRotateTokenOpen(false);
         }}
       />
+      <ConfirmDialog
+        open={confirmSecureLegacyOpen}
+        onOpenChange={setConfirmSecureLegacyOpen}
+        title="Secure Legacy Public Ports?"
+        description={`This recreates the legacy-exposed database container${(database?.legacy_public_branch_binding_count || 0) > 0 ? ` and ${database?.legacy_public_branch_binding_count} branch container(s)` : ""} with loopback-only host bindings. Expect a brief interruption while the data is moved into the secured replacement container. Any apps still connecting to old raw Postgres ports will stop working and should use the proxy connection string instead.`}
+        confirmText="Secure Now"
+        loading={actionLoading === "secure-legacy-bindings"}
+        onConfirm={async () => {
+          await secureLegacyBindings();
+          setConfirmSecureLegacyOpen(false);
+        }}
+      />
+
+      {database?.has_legacy_public_bindings && (
+        <div className="mx-6 md:mx-12 rounded-lg border border-amber-500/20 bg-amber-500/5 px-4 py-3 text-sm text-amber-100">
+          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div className="space-y-1">
+              <p className="font-medium text-amber-200">
+                Direct public database exposure detected
+              </p>
+              <p className="text-amber-100/80">
+                {database.legacy_public_database_binding
+                  ? "This database"
+                  : "At least one branch for this database"}{" "}
+                still has a legacy raw Postgres port published publicly.
+                {database.legacy_public_branch_binding_count
+                  ? ` ${database.legacy_public_branch_binding_count} branch container(s) are included in the migration.`
+                  : ""}
+              </p>
+            </div>
+            <Button
+              size="sm"
+              className="cursor-pointer"
+              onClick={() => setConfirmSecureLegacyOpen(true)}
+              disabled={actionLoading !== null}
+            >
+              {actionLoading === "secure-legacy-bindings"
+                ? "Securing..."
+                : "Secure Legacy Ports"}
+            </Button>
+          </div>
+        </div>
+      )}
 
       <div className="p-6 md:p-12 pb-4 md:pb-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 w-full">
           <div className="bg-card border border-border rounded-lg">

@@ -3,7 +3,7 @@ import {
   CaretDownIcon,
   ClockCounterClockwiseIcon,
   GearSixIcon,
-  Globe,
+  GlobeIcon,
   GraphIcon,
   HouseIcon,
   PlusIcon,
@@ -47,6 +47,7 @@ export default function Sidebar() {
   const canCreateDatabases = hasPermission("create_databases");
   const canEditProjects = hasPermission("edit_projects");
   const canAccessServer = hasPermission("server_access");
+  const canManageBackups = hasPermission("manage_backups");
   const canManageNotifications = hasPermission("manage_notifications");
 
   const startProjectEdit = (projectId: number, currentName: string) => {
@@ -133,15 +134,11 @@ export default function Sidebar() {
       return `${pathParts.join("/")}${location.search}${location.hash}`;
     }
 
-    if (location.pathname !== "/") {
-      return `${location.pathname}${location.search}${location.hash}`;
-    }
-
     return `/db/${nextDatabaseId}/dashboard`;
   };
 
   return (
-    <div className="w-72 p-2 flex flex-col h-full">
+    <div className="w-72 max-h-screen overflow-y-auto p-2 flex flex-col h-full">
       <div className="mb-8 flex flex-row items-center justify-between">
         {/* Combined Project/Database Selector */}
         <Popover open={selectorOpen} onOpenChange={setSelectorOpen}>
@@ -254,7 +251,10 @@ export default function Sidebar() {
                               <Link
                                 key={db.id}
                                 to={getDatabaseSwitchPath(db.id)}
-                                onClick={() => setSelectorOpen(false)}
+                                onClick={() => {
+                                  setSelectedDatabase(db);
+                                  setSelectorOpen(false);
+                                }}
                                 className={`flex flex-row items-center gap-2 p-2 rounded-md transition-colors ${
                                   selectedDatabase?.id === db.id
                                     ? "bg-accent"
@@ -417,28 +417,34 @@ export default function Sidebar() {
                 </Link>
               </li>
 
-              <li
-                className={`py-1.5 px-2.5 rounded-md ${
-                  location.pathname ===
-                  (selectedDatabase ? `/db/${selectedDatabase.id}/backup` : "/")
-                    ? "bg-muted/50"
-                    : ""
-                }`}
-              >
-                <Link
-                  to={
-                    selectedDatabase ? `/db/${selectedDatabase.id}/backup` : "/"
-                  }
-                  className="text-neutral-100 text-sm flex flex-row items-center gap-2"
+              {canManageBackups && (
+                <li
+                  className={`py-1.5 px-2.5 rounded-md ${
+                    location.pathname ===
+                    (selectedDatabase
+                      ? `/db/${selectedDatabase.id}/backup`
+                      : "/")
+                      ? "bg-muted/50"
+                      : ""
+                  }`}
                 >
-                  <ClockCounterClockwiseIcon
-                    size={18}
-                    weight="bold"
-                    className="text-neutral-400"
-                  />
-                  <span>Backup</span>
-                </Link>
-              </li>
+                  <Link
+                    to={
+                      selectedDatabase
+                        ? `/db/${selectedDatabase.id}/backup`
+                        : "/"
+                    }
+                    className="text-neutral-100 text-sm flex flex-row items-center gap-2"
+                  >
+                    <ClockCounterClockwiseIcon
+                      size={18}
+                      weight="bold"
+                      className="text-neutral-400"
+                    />
+                    <span>Backup</span>
+                  </Link>
+                </li>
+              )}
 
               {canManageNotifications && (
                 <li
@@ -553,7 +559,7 @@ export default function Sidebar() {
                     to="/web-server"
                     className="text-neutral-100 text-sm flex flex-row items-center gap-2"
                   >
-                    <Globe
+                    <GlobeIcon
                       size={18}
                       weight="bold"
                       className="text-neutral-400"

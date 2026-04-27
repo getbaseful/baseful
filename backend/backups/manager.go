@@ -29,7 +29,11 @@ type BackupSettings struct {
 	Bucket              string `json:"bucket"`
 	AccessKey           string `json:"access_key"`
 	SecretKey           string `json:"secret_key"`
+	HasAccessKey        bool   `json:"has_access_key,omitempty"`
+	HasSecretKey        bool   `json:"has_secret_key,omitempty"`
 	PathPrefix          string `json:"path_prefix"`
+	AutomationEnabled   bool   `json:"automation_enabled"`
+	AutomationFrequency string `json:"automation_frequency"`
 	EncryptionEnabled   bool   `json:"encryption_enabled"`
 	EncryptionPublicKey string `json:"encryption_public_key"`
 }
@@ -62,10 +66,10 @@ func GetBackupSettings(databaseID int) (*BackupSettings, error) {
 	var s BackupSettings
 	s.DatabaseID = databaseID
 	err := db.DB.QueryRow(`
-		SELECT enabled, provider, endpoint, region, bucket, access_key, secret_key, path_prefix, COALESCE(encryption_enabled, 0), COALESCE(encryption_public_key, '')
+		SELECT enabled, provider, endpoint, region, bucket, access_key, secret_key, path_prefix, COALESCE(automation_enabled, 0), COALESCE(automation_frequency, 'daily'), COALESCE(encryption_enabled, 0), COALESCE(encryption_public_key, '')
 		FROM backup_settings WHERE database_id = ?
 	`, databaseID).Scan(
-		&s.Enabled, &s.Provider, &s.Endpoint, &s.Region, &s.Bucket, &s.AccessKey, &s.SecretKey, &s.PathPrefix, &s.EncryptionEnabled, &s.EncryptionPublicKey,
+		&s.Enabled, &s.Provider, &s.Endpoint, &s.Region, &s.Bucket, &s.AccessKey, &s.SecretKey, &s.PathPrefix, &s.AutomationEnabled, &s.AutomationFrequency, &s.EncryptionEnabled, &s.EncryptionPublicKey,
 	)
 	if err == sql.ErrNoRows {
 		// Return defaults
@@ -76,6 +80,8 @@ func GetBackupSettings(databaseID int) (*BackupSettings, error) {
 			Endpoint:            "",
 			Region:              "us-east-1",
 			PathPrefix:          "/baseful/backups",
+			AutomationEnabled:   false,
+			AutomationFrequency: "daily",
 			EncryptionEnabled:   false,
 			EncryptionPublicKey: "",
 		}, nil
@@ -92,10 +98,13 @@ func SaveBackupSettings(s *BackupSettings) error {
 			return fmt.Errorf("encryption is enabled but encryption_public_key is empty")
 		}
 	}
+	if strings.TrimSpace(s.AutomationFrequency) == "" {
+		s.AutomationFrequency = "daily"
+	}
 
 	_, err := db.DB.Exec(`
-		INSERT INTO backup_settings (database_id, enabled, provider, endpoint, region, bucket, access_key, secret_key, path_prefix, encryption_enabled, encryption_public_key, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		INSERT INTO backup_settings (database_id, enabled, provider, endpoint, region, bucket, access_key, secret_key, path_prefix, automation_enabled, automation_frequency, encryption_enabled, encryption_public_key, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(database_id) DO UPDATE SET
 			enabled=excluded.enabled,
 			provider=excluded.provider,
@@ -105,10 +114,12 @@ func SaveBackupSettings(s *BackupSettings) error {
 			access_key=excluded.access_key,
 			secret_key=excluded.secret_key,
 			path_prefix=excluded.path_prefix,
+			automation_enabled=excluded.automation_enabled,
+			automation_frequency=excluded.automation_frequency,
 			encryption_enabled=excluded.encryption_enabled,
 			encryption_public_key=excluded.encryption_public_key,
 			updated_at=CURRENT_TIMESTAMP
-	`, s.DatabaseID, s.Enabled, s.Provider, s.Endpoint, s.Region, s.Bucket, s.AccessKey, s.SecretKey, s.PathPrefix, s.EncryptionEnabled, s.EncryptionPublicKey)
+	`, s.DatabaseID, s.Enabled, s.Provider, s.Endpoint, s.Region, s.Bucket, s.AccessKey, s.SecretKey, s.PathPrefix, s.AutomationEnabled, s.AutomationFrequency, s.EncryptionEnabled, s.EncryptionPublicKey)
 	return err
 }
 

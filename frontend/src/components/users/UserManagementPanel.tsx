@@ -51,6 +51,9 @@ const PERMISSION_LABELS: Record<string, string> = {
   create_projects: "Create Projects",
   edit_projects: "Edit Project Names",
   create_databases: "Create Databases",
+  manage_backups: "Manage Backups",
+  delete_databases: "Delete Databases",
+  container_exec: "Container Terminal Access",
 };
 
 export function UserManagementPanel({ showHeader = true }: UserManagementPanelProps) {
@@ -559,6 +562,11 @@ export function UserManagementPanel({ showHeader = true }: UserManagementPanelPr
                 <label className="text-xs uppercase tracking-wider text-neutral-500 block mb-2">
                   Permissions
                 </label>
+                <div className="mb-3 rounded-md border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-100">
+                  Granting <span className="font-medium">Server Access</span>{" "}
+                  lets this user view sensitive infrastructure details,
+                  including backup configuration secrets.
+                </div>
                 {availablePermissions.length === 0 ? (
                   <p className="text-sm text-neutral-500">No permissions configured.</p>
                 ) : (

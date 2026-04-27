@@ -29,7 +29,8 @@ import { DitherAvatar } from "../ui/hash-avatar";
 import { useAuth } from "@/context/AuthContext";
 
 export default function MobileDock() {
-  const { selectedDatabase, databases, refreshDatabases } = useDatabase();
+  const { selectedDatabase, setSelectedDatabase, databases, refreshDatabases } =
+    useDatabase();
   const { projects, refreshProjects } = useProject();
   const { user, hasPermission } = useAuth();
   const location = useLocation();
@@ -40,6 +41,7 @@ export default function MobileDock() {
   const canCreateProjects = hasPermission("create_projects");
   const canCreateDatabases = hasPermission("create_databases");
   const canAccessServer = hasPermission("server_access");
+  const canManageBackups = hasPermission("manage_backups");
   const canManageNotifications = hasPermission("manage_notifications");
   // Handle scroll to hide/show dock
   const lastScrollY = useRef(0);
@@ -130,10 +132,6 @@ export default function MobileDock() {
       return `${pathParts.join("/")}${location.search}${location.hash}`;
     }
 
-    if (location.pathname !== "/") {
-      return `${location.pathname}${location.search}${location.hash}`;
-    }
-
     return `/db/${nextDatabaseId}/dashboard`;
   };
 
@@ -157,11 +155,15 @@ export default function MobileDock() {
               icon: TerminalIcon,
               path: `/db/${selectedDatabase.id}/sql-editor`,
             },
-            {
-              name: "Backup",
-              icon: ClockCounterClockwiseIcon,
-              path: `/db/${selectedDatabase.id}/backup`,
-            },
+            ...(canManageBackups
+              ? [
+                  {
+                    name: "Backup",
+                    icon: ClockCounterClockwiseIcon,
+                    path: `/db/${selectedDatabase.id}/backup`,
+                  },
+                ]
+              : []),
             ...(canManageNotifications
               ? [
                   {
@@ -413,6 +415,7 @@ export default function MobileDock() {
                                     <Link
                                       to={getDatabaseSwitchPath(db.id)}
                                       onClick={() => {
+                                        setSelectedDatabase(db);
                                         setSelectorOpen(false);
                                       }}
                                       className={`flex flex-row items-center gap-2 p-2 rounded-md transition-colors ${

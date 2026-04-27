@@ -67,18 +67,22 @@ func InitDB() error {
         name TEXT NOT NULL,
         type TEXT NOT NULL,
         project_id INTEGER,
+        owner_user_id INTEGER,
         server_id INTEGER,
         host TEXT,
         port INTEGER,
         container_id TEXT,
         version TEXT,
         password TEXT,
+        proxy_username TEXT,
+        proxy_password TEXT,
         status TEXT DEFAULT 'running',
         max_cpu REAL DEFAULT 1.0,
         max_ram_mb INTEGER DEFAULT 512,
         max_storage_mb INTEGER DEFAULT 1024,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (project_id) REFERENCES projects(id),
+        FOREIGN KEY (owner_user_id) REFERENCES users(id),
         FOREIGN KEY (server_id) REFERENCES servers(id)
     );
 
@@ -177,10 +181,47 @@ func InitDB() error {
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS topology_service_cards (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        backup_cards_json TEXT NOT NULL DEFAULT '[]',
+        automation_cards_json TEXT NOT NULL DEFAULT '[]',
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS topology_user_service_cards (
+        user_id INTEGER PRIMARY KEY,
+        backup_cards_json TEXT NOT NULL DEFAULT '[]',
+        automation_cards_json TEXT NOT NULL DEFAULT '[]',
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS topology_backup_card_profiles (
+        card_id TEXT PRIMARY KEY,
+        owner_user_id INTEGER,
+        source_database_id INTEGER,
+        provider TEXT,
+        endpoint TEXT,
+        region TEXT,
+        bucket TEXT,
+        access_key TEXT,
+        secret_key TEXT,
+        path_prefix TEXT,
+        automation_enabled BOOLEAN DEFAULT 0,
+        automation_frequency TEXT DEFAULT 'daily',
+        encryption_enabled BOOLEAN DEFAULT 0,
+        encryption_public_key TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id),
+        FOREIGN KEY (source_database_id) REFERENCES databases(id)
+    );
+
     -- Insert default settings if they don't exist
     INSERT OR IGNORE INTO settings (key, value) VALUES ('metrics_enabled', 'true');
     INSERT OR IGNORE INTO settings (key, value) VALUES ('metrics_sample_rate', '5');
     INSERT OR IGNORE INTO settings (key, value) VALUES ('notifications_master_enabled', 'false');
+    INSERT OR IGNORE INTO topology_service_cards (id, backup_cards_json, automation_cards_json) VALUES (1, '[]', '[]');
     `
 
 	_, err = DB.Exec(schema)
@@ -200,6 +241,8 @@ func InitDB() error {
 		access_key TEXT,
 		secret_key TEXT,
 		path_prefix TEXT,
+		automation_enabled BOOLEAN DEFAULT 0,
+		automation_frequency TEXT DEFAULT 'daily',
 		encryption_enabled BOOLEAN DEFAULT 0,
 		encryption_public_key TEXT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -229,17 +272,22 @@ func InitDB() error {
 	// Migration: Add object_key if not exists
 	DB.Exec("ALTER TABLE backups ADD COLUMN object_key TEXT")
 	DB.Exec("ALTER TABLE backups ADD COLUMN is_encrypted BOOLEAN DEFAULT 0")
+	DB.Exec("ALTER TABLE backup_settings ADD COLUMN automation_enabled BOOLEAN DEFAULT 0")
+	DB.Exec("ALTER TABLE backup_settings ADD COLUMN automation_frequency TEXT DEFAULT 'daily'")
 	DB.Exec("ALTER TABLE backup_settings ADD COLUMN encryption_enabled BOOLEAN DEFAULT 0")
 	DB.Exec("ALTER TABLE backup_settings ADD COLUMN encryption_public_key TEXT")
 
 	// Migration: Add project_id column if it doesn't exist
 	// SQLite doesn't support ADD COLUMN IF NOT EXISTS, so we just ignore errors
 	DB.Exec("ALTER TABLE databases ADD COLUMN project_id INTEGER DEFAULT 0")
+	DB.Exec("ALTER TABLE databases ADD COLUMN owner_user_id INTEGER")
 
 	// Migration: Add resource limit columns if they don't exist
 	DB.Exec("ALTER TABLE databases ADD COLUMN max_cpu REAL DEFAULT 1.0")
 	DB.Exec("ALTER TABLE databases ADD COLUMN max_ram_mb INTEGER DEFAULT 512")
 	DB.Exec("ALTER TABLE databases ADD COLUMN max_storage_mb INTEGER DEFAULT 1024")
+	DB.Exec("ALTER TABLE databases ADD COLUMN proxy_username TEXT")
+	DB.Exec("ALTER TABLE databases ADD COLUMN proxy_password TEXT")
 
 	// Migration: Add mapped_port for local dev access (running proxy on host)
 	DB.Exec("ALTER TABLE databases ADD COLUMN mapped_port INTEGER DEFAULT 0")
@@ -312,6 +360,18 @@ func InitDB() error {
         enabled BOOLEAN NOT NULL DEFAULT 0,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`)
+	DB.Exec(`CREATE TABLE IF NOT EXISTS topology_service_cards (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        backup_cards_json TEXT NOT NULL DEFAULT '[]',
+        automation_cards_json TEXT NOT NULL DEFAULT '[]',
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`)
+	DB.Exec(`INSERT OR IGNORE INTO topology_service_cards (id, backup_cards_json, automation_cards_json, updated_at)
+        SELECT 1, backup_cards_json, automation_cards_json, updated_at
+        FROM user_topology_service_cards
+        ORDER BY updated_at DESC
+        LIMIT 1`)
+	DB.Exec("INSERT OR IGNORE INTO topology_service_cards (id, backup_cards_json, automation_cards_json) VALUES (1, '[]', '[]')")
 	// One-time migration: backfill existing non-admin users with access to all
 	// existing projects to preserve legacy behavior during initial rollout.
 	// Guarded by a settings flag so it does not re-run on every restart.
@@ -339,6 +399,8 @@ type DatabaseInfo struct {
 	Port       int
 	MappedPort int
 	Password   string
+	ProxyUser  string
+	ProxyPass  string
 	Type       string
 }
 
@@ -346,12 +408,12 @@ type DatabaseInfo struct {
 func GetDatabaseByID(databaseID int) (*DatabaseInfo, error) {
 	var dbInfo DatabaseInfo
 	err := DB.QueryRow(`
-		SELECT id, name, host, port, mapped_port, password, type
+		SELECT id, name, host, port, mapped_port, password, COALESCE(proxy_username, ''), COALESCE(proxy_password, ''), type
 		FROM databases
 		WHERE id = ?
 	`, databaseID).Scan(
 		&dbInfo.ID, &dbInfo.Name, &dbInfo.Host,
-		&dbInfo.Port, &dbInfo.MappedPort, &dbInfo.Password, &dbInfo.Type,
+		&dbInfo.Port, &dbInfo.MappedPort, &dbInfo.Password, &dbInfo.ProxyUser, &dbInfo.ProxyPass, &dbInfo.Type,
 	)
 
 	if err != nil {

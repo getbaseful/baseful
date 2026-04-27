@@ -302,7 +302,8 @@ func getEnv(key, defaultValue string) string {
 
 func main() {
 	fmt.Println("PostgreSQL Proxy Test Client")
-	fmt.Println("=============================\n")
+	fmt.Println("=============================")
+	fmt.Println()
 
 	// Check for JWT token
 	jwtToken := os.Getenv("JWT_TOKEN")

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -34,6 +35,7 @@ import (
 	"baseful/docker"
 	"baseful/metrics"
 	"baseful/proxy"
+	"baseful/security"
 	"baseful/system"
 )
 
@@ -47,6 +49,8 @@ const (
 var (
 	proxyLogTokenFieldRe    = regexp.MustCompile(`("token_id"\s*:\s*")[^"]*(")`)
 	proxyLogConnStringToken = regexp.MustCompile(`(postgres(?:ql)?://[^:\s]+:)[^@\s]+(@)`)
+	loginIPRateLimiter      = security.NewFixedWindowLimiter(30, time.Minute)
+	loginIdentityLimiter    = security.NewFixedWindowLimiter(8, time.Minute)
 )
 
 func getFreePort() (int, error) {
@@ -117,6 +121,10 @@ func getClientProxyHost() string {
 		}
 	}
 	return proxyHost
+}
+
+func recommendedProxySSLMode(host string) string {
+	return auth.RecommendedProxySSLMode(host)
 }
 
 func readProxyLogTail(logPath string, tail int) ([]string, error) {
@@ -311,6 +319,328 @@ func requireDatabaseAccess(c *gin.Context, databaseID int) bool {
 	return true
 }
 
+func resolveContainerProjectID(ctr docker.ContainerInfo) int {
+	if ctr.ID != "" {
+		var projectID int
+		err := db.DB.QueryRow(
+			"SELECT COALESCE(project_id, 0) FROM databases WHERE container_id = ?",
+			ctr.ID,
+		).Scan(&projectID)
+		if err == nil && projectID > 0 {
+			return projectID
+		}
+
+		err = db.DB.QueryRow(`
+			SELECT COALESCE(d.project_id, 0)
+			FROM branches b
+			INNER JOIN databases d ON d.id = b.database_id
+			WHERE b.container_id = ?
+		`, ctr.ID).Scan(&projectID)
+		if err == nil && projectID > 0 {
+			return projectID
+		}
+	}
+
+	if databaseName := strings.TrimSpace(ctr.Labels["baseful.database"]); databaseName != "" {
+		var projectID int
+		err := db.DB.QueryRow(
+			"SELECT COALESCE(project_id, 0) FROM databases WHERE LOWER(name) = LOWER(?)",
+			databaseName,
+		).Scan(&projectID)
+		if err == nil && projectID > 0 {
+			return projectID
+		}
+	}
+
+	if rawProjectID := strings.TrimSpace(ctr.Labels["baseful.project_id"]); rawProjectID != "" {
+		projectID, _ := strconv.Atoi(rawProjectID)
+		return projectID
+	}
+
+	return 0
+}
+
+func deleteDatabaseResources(databaseID int) error {
+	var containerID string
+	if err := db.DB.QueryRow(
+		"SELECT COALESCE(container_id, '') FROM databases WHERE id = ?",
+		databaseID,
+	).Scan(&containerID); err != nil {
+		return err
+	}
+
+	containerIDs := []string{}
+	if containerID != "" {
+		containerIDs = append(containerIDs, containerID)
+	}
+
+	rows, err := db.DB.Query(
+		"SELECT COALESCE(container_id, '') FROM branches WHERE database_id = ?",
+		databaseID,
+	)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var branchContainerID string
+		if err := rows.Scan(&branchContainerID); err != nil {
+			return err
+		}
+		if branchContainerID != "" {
+			containerIDs = append(containerIDs, branchContainerID)
+		}
+	}
+
+	if len(containerIDs) > 0 {
+		ctx := context.Background()
+		cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+		if err != nil {
+			return fmt.Errorf("failed to connect to Docker: %w", err)
+		}
+		defer cli.Close()
+
+		for _, currentContainerID := range containerIDs {
+			_ = cli.ContainerStop(ctx, currentContainerID, container.StopOptions{})
+			_ = cli.ContainerRemove(ctx, currentContainerID, container.RemoveOptions{Force: true})
+		}
+	}
+
+	db.RevokeAllTokensForDatabase(databaseID)
+	db.DB.Exec("DELETE FROM database_tokens WHERE database_id = ?", databaseID)
+	db.DB.Exec("DELETE FROM database_notification_preferences WHERE database_id = ?", databaseID)
+	db.DB.Exec("DELETE FROM backups WHERE database_id = ?", databaseID)
+	db.DB.Exec("DELETE FROM backup_settings WHERE database_id = ?", databaseID)
+	db.DB.Exec("DELETE FROM branches WHERE database_id = ?", databaseID)
+
+	if _, err := db.DB.Exec("DELETE FROM databases WHERE id = ?", databaseID); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type topologyServiceCardsPayload struct {
+	BackupCards     []map[string]any `json:"backupCards"`
+	AutomationCards []map[string]any `json:"automationCards"`
+}
+
+func userHasAnyPermission(c *gin.Context, permissions ...string) (bool, error) {
+	isAdmin := c.MustGet("is_admin").(bool)
+	if isAdmin {
+		return true, nil
+	}
+
+	userID := c.MustGet("user_id").(int)
+	for _, permission := range permissions {
+		allowed, err := db.UserHasPermission(userID, permission)
+		if err != nil {
+			return false, err
+		}
+		if allowed {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func requireAnyPermission(c *gin.Context, permissions ...string) bool {
+	allowed, err := userHasAnyPermission(c, permissions...)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to validate permissions"})
+		return false
+	}
+	if !allowed {
+		c.JSON(403, gin.H{"error": "Permission denied"})
+		return false
+	}
+	return true
+}
+
+func requireBackupManagement(c *gin.Context) bool {
+	return requireAnyPermission(c, db.PermissionManageBackups)
+}
+
+func requireDeleteDatabasePermission(c *gin.Context) bool {
+	return requireAnyPermission(c, db.PermissionDeleteDatabases, db.PermissionCreateDatabases)
+}
+
+func requireContainerExecPermission(c *gin.Context) bool {
+	return requireAnyPermission(c, db.PermissionContainerExec)
+}
+
+func parseTopologyCardInt(value any) int {
+	switch v := value.(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case json.Number:
+		if parsed, err := v.Int64(); err == nil {
+			return int(parsed)
+		}
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(v))
+		if err == nil {
+			return parsed
+		}
+	}
+	return 0
+}
+
+func sanitizeTopologyBackupCard(card map[string]any) map[string]any {
+	sanitized := make(map[string]any, len(card))
+	for key, value := range card {
+		sanitized[key] = value
+	}
+
+	rawConfig, ok := card["config"].(map[string]any)
+	if !ok {
+		return sanitized
+	}
+
+	config := make(map[string]any, len(rawConfig)+2)
+	for key, value := range rawConfig {
+		config[key] = value
+	}
+	if accessKey, ok := rawConfig["access_key"].(string); ok {
+		config["has_access_key"] = strings.TrimSpace(accessKey) != ""
+	} else if _, ok := rawConfig["has_access_key"]; !ok {
+		config["has_access_key"] = false
+	}
+	if secretKey, ok := rawConfig["secret_key"].(string); ok {
+		config["has_secret_key"] = strings.TrimSpace(secretKey) != ""
+	} else if _, ok := rawConfig["has_secret_key"]; !ok {
+		config["has_secret_key"] = false
+	}
+	if rawHasAccess, ok := rawConfig["has_access_key"].(bool); ok && rawHasAccess {
+		config["has_access_key"] = true
+	}
+	if rawHasSecret, ok := rawConfig["has_secret_key"].(bool); ok && rawHasSecret {
+		config["has_secret_key"] = true
+	}
+	config["access_key"] = ""
+	config["secret_key"] = ""
+	sanitized["config"] = config
+	return sanitized
+}
+
+func loadLegacyTopologyServiceCards() (topologyServiceCardsPayload, error) {
+	var backupCardsJSON, automationCardsJSON string
+	err := db.DB.QueryRow(
+		"SELECT backup_cards_json, automation_cards_json FROM topology_service_cards WHERE id = 1",
+	).Scan(&backupCardsJSON, &automationCardsJSON)
+	if err == sql.ErrNoRows {
+		return topologyServiceCardsPayload{
+			BackupCards:     []map[string]any{},
+			AutomationCards: []map[string]any{},
+		}, nil
+	}
+	if err != nil {
+		return topologyServiceCardsPayload{}, err
+	}
+
+	var payload topologyServiceCardsPayload
+	if err := json.Unmarshal([]byte(backupCardsJSON), &payload.BackupCards); err != nil {
+		payload.BackupCards = []map[string]any{}
+	}
+	if err := json.Unmarshal([]byte(automationCardsJSON), &payload.AutomationCards); err != nil {
+		payload.AutomationCards = []map[string]any{}
+	}
+	return payload, nil
+}
+
+func loadTopologyServiceCardsForUser(userID int) (topologyServiceCardsPayload, error) {
+	var backupCardsJSON, automationCardsJSON string
+	err := db.DB.QueryRow(
+		"SELECT backup_cards_json, automation_cards_json FROM topology_user_service_cards WHERE user_id = ?",
+		userID,
+	).Scan(&backupCardsJSON, &automationCardsJSON)
+	if err == sql.ErrNoRows {
+		return loadLegacyTopologyServiceCards()
+	}
+	if err != nil {
+		return topologyServiceCardsPayload{}, err
+	}
+
+	var payload topologyServiceCardsPayload
+	if err := json.Unmarshal([]byte(backupCardsJSON), &payload.BackupCards); err != nil {
+		payload.BackupCards = []map[string]any{}
+	}
+	if err := json.Unmarshal([]byte(automationCardsJSON), &payload.AutomationCards); err != nil {
+		payload.AutomationCards = []map[string]any{}
+	}
+	return payload, nil
+}
+
+func saveTopologyServiceCardsForUser(userID int, payload topologyServiceCardsPayload) error {
+	sanitizedBackupCards := make([]map[string]any, 0, len(payload.BackupCards))
+	for _, card := range payload.BackupCards {
+		sanitizedBackupCards = append(sanitizedBackupCards, sanitizeTopologyBackupCard(card))
+	}
+
+	backupCardsJSON, err := json.Marshal(sanitizedBackupCards)
+	if err != nil {
+		return err
+	}
+	automationCardsJSON, err := json.Marshal(payload.AutomationCards)
+	if err != nil {
+		return err
+	}
+
+	_, err = db.DB.Exec(
+		`INSERT INTO topology_user_service_cards (user_id, backup_cards_json, automation_cards_json, updated_at)
+		 VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+		 ON CONFLICT(user_id) DO UPDATE SET
+		   backup_cards_json = excluded.backup_cards_json,
+		   automation_cards_json = excluded.automation_cards_json,
+		   updated_at = CURRENT_TIMESTAMP`,
+		userID,
+		string(backupCardsJSON),
+		string(automationCardsJSON),
+	)
+	return err
+}
+
+func findBackupCardForUser(userID int, cardID string) (map[string]any, error) {
+	payload, err := loadTopologyServiceCardsForUser(userID)
+	if err != nil {
+		return nil, err
+	}
+	for _, card := range payload.BackupCards {
+		if strings.TrimSpace(fmt.Sprint(card["id"])) == cardID {
+			return card, nil
+		}
+	}
+	return nil, nil
+}
+
+func canUseBackupCardProfile(c *gin.Context, profile *backups.BackupCardProfile) (bool, error) {
+	if profile == nil {
+		return false, nil
+	}
+
+	isAdmin := c.MustGet("is_admin").(bool)
+	if isAdmin {
+		return true, nil
+	}
+
+	userID := c.MustGet("user_id").(int)
+	if profile.OwnerUserID.Valid && int(profile.OwnerUserID.Int64) == userID {
+		return true, nil
+	}
+
+	if profile.SourceDatabaseID.Valid && profile.SourceDatabaseID.Int64 > 0 {
+		return db.UserCanAccessDatabase(userID, int(profile.SourceDatabaseID.Int64))
+	}
+
+	return false, nil
+}
+
 func requestSQLFromOpenRouter(apiKey, systemPrompt, userPrompt string) (string, error) {
 	type message struct {
 		Role    string `json:"role"`
@@ -412,6 +742,9 @@ func main() {
 	if err := db.InitDB(); err != nil {
 		panic(err)
 	}
+	if err := backups.MigrateLegacyTopologyBackupCardProfiles(); err != nil {
+		fmt.Printf("Warning: Failed to migrate legacy backup card profiles: %v\n", err)
+	}
 
 	// Initialize metrics system
 	if err := metrics.InitMetricsDB(); err != nil {
@@ -436,6 +769,13 @@ func main() {
 	if err := docker.EnsureNetwork(); err != nil {
 		fmt.Printf("Warning: Failed to create Docker network: %v\n", err)
 	}
+
+	fmt.Println("Provisioning database proxy roles...")
+	if err := provisionExistingDatabaseProxyAccess(); err != nil {
+		fmt.Printf("Error provisioning proxy database access: %v\n", err)
+		os.Exit(1)
+	}
+	warnAboutLegacyPublicDatabaseBindings()
 
 	fmt.Println("Initializing PostgreSQL Proxy (Background mode)...")
 	go func() {
@@ -481,6 +821,13 @@ func main() {
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(400, gin.H{"error": "Email and password are required"})
+			return
+		}
+
+		clientIP := c.ClientIP()
+		emailKey := strings.ToLower(strings.TrimSpace(req.Email))
+		if !loginIPRateLimiter.Allow("login:ip:"+clientIP) || !loginIdentityLimiter.Allow("login:identity:"+clientIP+":"+emailKey) {
+			c.JSON(429, gin.H{"error": "Too many login attempts. Please wait before trying again."})
 			return
 		}
 
@@ -597,15 +944,21 @@ func main() {
 		})
 	})
 
-	// Debug endpoint to reset admin (Only for dev/retry)
-	r.POST("/api/debug/reset-admin", func(c *gin.Context) {
-		_, err := db.DB.Exec("DELETE FROM users")
-		if err != nil {
-			c.JSON(500, gin.H{"error": "Failed to reset users"})
-			return
-		}
-		c.JSON(200, gin.H{"message": "All users deleted. You can now setup a new admin."})
-	})
+	// Debug endpoint to reset admin (disabled by default; only for explicit local development use)
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("ENABLE_UNSAFE_RESET_ADMIN")), "true") {
+		r.POST("/api/debug/reset-admin", func(c *gin.Context) {
+			if ip := net.ParseIP(c.ClientIP()); ip == nil || !ip.IsLoopback() {
+				c.JSON(403, gin.H{"error": "reset-admin is only available from localhost"})
+				return
+			}
+			_, err := db.DB.Exec("DELETE FROM users")
+			if err != nil {
+				c.JSON(500, gin.H{"error": "Failed to reset users"})
+				return
+			}
+			c.JSON(200, gin.H{"message": "All users deleted. You can now setup a new admin."})
+		})
+	}
 
 	r.POST("/api/auth/logout", func(c *gin.Context) {
 		clearSessionCookie(c)
@@ -1437,6 +1790,9 @@ func main() {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
 			return
 		}
+		if !requireBackupManagement(c) {
+			return
+		}
 		if !requireDatabaseAccess(c, id) {
 			return
 		}
@@ -1459,6 +1815,9 @@ func main() {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
 			return
 		}
+		if !requireBackupManagement(c) {
+			return
+		}
 		if !requireDatabaseAccess(c, id) {
 			return
 		}
@@ -1467,7 +1826,7 @@ func main() {
 			c.JSON(500, gin.H{"error": err.Error()})
 			return
 		}
-		c.JSON(200, settings)
+		c.JSON(200, backups.SanitizeBackupSettingsForResponse(settings))
 	})
 
 	r.POST("/api/databases/:id/backups/settings", func(c *gin.Context) {
@@ -1475,6 +1834,9 @@ func main() {
 		id, err := strconv.Atoi(idStr)
 		if err != nil {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireBackupManagement(c) {
 			return
 		}
 		if !requireDatabaseAccess(c, id) {
@@ -1486,6 +1848,10 @@ func main() {
 			return
 		}
 		settings.DatabaseID = id
+		if err := backups.PrepareBackupSettingsForSave(id, &settings); err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
 		if err := backups.SaveBackupSettings(&settings); err != nil {
 			c.JSON(500, gin.H{"error": err.Error()})
 			return
@@ -1498,6 +1864,9 @@ func main() {
 		id, err := strconv.Atoi(idStr)
 		if err != nil {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireBackupManagement(c) {
 			return
 		}
 		if !requireDatabaseAccess(c, id) {
@@ -1535,6 +1904,9 @@ func main() {
 		id, err := strconv.Atoi(idStr)
 		if err != nil {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireBackupManagement(c) {
 			return
 		}
 		if !requireDatabaseAccess(c, id) {
@@ -1589,6 +1961,9 @@ func main() {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
 			return
 		}
+		if !requireBackupManagement(c) {
+			return
+		}
 		if !requireDatabaseAccess(c, id) {
 			return
 		}
@@ -1625,6 +2000,9 @@ func main() {
 		id, err := strconv.Atoi(idStr)
 		if err != nil {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireBackupManagement(c) {
 			return
 		}
 		if !requireDatabaseAccess(c, id) {
@@ -1701,6 +2079,9 @@ func main() {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
 			return
 		}
+		if !requireBackupManagement(c) {
+			return
+		}
 		if !requireDatabaseAccess(c, id) {
 			return
 		}
@@ -1756,6 +2137,9 @@ func main() {
 			c.JSON(400, gin.H{"error": "Invalid database ID"})
 			return
 		}
+		if !requireBackupManagement(c) {
+			return
+		}
 		if !requireDatabaseAccess(c, id) {
 			return
 		}
@@ -1807,6 +2191,251 @@ func main() {
 			}
 		}()
 		c.JSON(200, gin.H{"message": "Restore started"})
+	})
+
+	r.GET("/api/topology/service-cards", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
+		if !requireBackupManagement(c) {
+			return
+		}
+		userID := c.MustGet("user_id").(int)
+		payload, err := loadTopologyServiceCardsForUser(userID)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to load service cards"})
+			return
+		}
+
+		sanitizedBackupCards := make([]map[string]any, 0, len(payload.BackupCards))
+		for _, card := range payload.BackupCards {
+			sanitizedBackupCards = append(sanitizedBackupCards, sanitizeTopologyBackupCard(card))
+		}
+		payload.BackupCards = sanitizedBackupCards
+
+		c.JSON(200, payload)
+	})
+
+	r.PUT("/api/topology/service-cards", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
+		if !requireBackupManagement(c) {
+			return
+		}
+
+		var payload topologyServiceCardsPayload
+		if err := c.BindJSON(&payload); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid request"})
+			return
+		}
+
+		userID := c.MustGet("user_id").(int)
+		if err := saveTopologyServiceCardsForUser(userID, payload); err != nil {
+			c.JSON(500, gin.H{"error": "Failed to save service cards"})
+			return
+		}
+
+		c.JSON(200, gin.H{"message": "Service cards saved"})
+	})
+
+	r.POST("/api/topology/backup-cards", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
+		if !requireBackupManagement(c) {
+			return
+		}
+
+		var req struct {
+			ID               string                 `json:"id"`
+			Label            string                 `json:"label"`
+			Config           backups.BackupSettings `json:"config"`
+			SourceDatabaseID int                    `json:"sourceDatabaseId"`
+		}
+		if err := c.BindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid request"})
+			return
+		}
+		if strings.TrimSpace(req.ID) == "" {
+			c.JSON(400, gin.H{"error": "Card ID is required"})
+			return
+		}
+
+		var sourceDatabaseID *int
+		if req.SourceDatabaseID > 0 {
+			if !requireDatabaseAccess(c, req.SourceDatabaseID) {
+				return
+			}
+			sourceDatabaseID = &req.SourceDatabaseID
+		}
+
+		userID := c.MustGet("user_id").(int)
+		profile, err := backups.CreateBackupCardProfile(req.ID, userID, sourceDatabaseID, req.Config)
+		if err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+
+		c.JSON(200, gin.H{
+			"id":    req.ID,
+			"label": req.Label,
+			"config": gin.H{
+				"database_id":           0,
+				"enabled":               true,
+				"provider":              profile.Settings.Provider,
+				"endpoint":              profile.Settings.Endpoint,
+				"region":                profile.Settings.Region,
+				"bucket":                profile.Settings.Bucket,
+				"access_key":            "",
+				"secret_key":            "",
+				"has_access_key":        strings.TrimSpace(profile.Settings.AccessKey) != "",
+				"has_secret_key":        strings.TrimSpace(profile.Settings.SecretKey) != "",
+				"path_prefix":           profile.Settings.PathPrefix,
+				"automation_enabled":    profile.Settings.AutomationEnabled,
+				"automation_frequency":  profile.Settings.AutomationFrequency,
+				"encryption_enabled":    profile.Settings.EncryptionEnabled,
+				"encryption_public_key": profile.Settings.EncryptionPublicKey,
+			},
+			"databaseId": nil,
+		})
+	})
+
+	r.POST("/api/topology/backup-cards/:id/apply", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
+		if !requireBackupManagement(c) {
+			return
+		}
+
+		cardID := strings.TrimSpace(c.Param("id"))
+		if cardID == "" {
+			c.JSON(400, gin.H{"error": "Invalid card ID"})
+			return
+		}
+
+		var req struct {
+			DatabaseID int `json:"databaseId"`
+		}
+		if err := c.BindJSON(&req); err != nil || req.DatabaseID <= 0 {
+			c.JSON(400, gin.H{"error": "A valid target database is required"})
+			return
+		}
+		if !requireDatabaseAccess(c, req.DatabaseID) {
+			return
+		}
+
+		userID := c.MustGet("user_id").(int)
+		card, err := findBackupCardForUser(userID, cardID)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to resolve backup card"})
+			return
+		}
+		if card == nil {
+			c.JSON(404, gin.H{"error": "Backup card not found"})
+			return
+		}
+
+		profile, err := backups.GetBackupCardProfile(cardID)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to load backup card profile"})
+			return
+		}
+		if profile != nil {
+			allowed, err := canUseBackupCardProfile(c, profile)
+			if err != nil {
+				c.JSON(500, gin.H{"error": "Failed to validate backup card access"})
+				return
+			}
+			if !allowed {
+				c.JSON(403, gin.H{"error": "Access denied for this backup card"})
+				return
+			}
+		}
+		if profile == nil {
+			sourceDatabaseID := parseTopologyCardInt(card["databaseId"])
+			if sourceDatabaseID <= 0 {
+				c.JSON(400, gin.H{"error": "Backup card does not have a secure profile yet"})
+				return
+			}
+			if !requireDatabaseAccess(c, sourceDatabaseID) {
+				return
+			}
+			if err := backups.EnsureBackupCardProfileFromDatabase(cardID, userID, sourceDatabaseID); err != nil {
+				c.JSON(500, gin.H{"error": err.Error()})
+				return
+			}
+			profile, err = backups.GetBackupCardProfile(cardID)
+			if err != nil || profile == nil {
+				c.JSON(500, gin.H{"error": "Failed to finalize backup card profile"})
+				return
+			}
+		}
+
+		profile.Settings.DatabaseID = req.DatabaseID
+		profile.Settings.Enabled = true
+		if err := backups.SaveBackupSettings(&profile.Settings); err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+
+		sourceDatabaseID := req.DatabaseID
+		if err := backups.UpsertBackupCardProfile(cardID, userID, &sourceDatabaseID, profile.Settings); err != nil {
+			c.JSON(500, gin.H{"error": "Failed to persist backup card profile"})
+			return
+		}
+
+		c.JSON(200, gin.H{"message": "Backup configuration applied"})
+	})
+
+	r.DELETE("/api/topology/backup-cards/:id", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
+		if !requireBackupManagement(c) {
+			return
+		}
+
+		cardID := strings.TrimSpace(c.Param("id"))
+		if cardID == "" {
+			c.JSON(400, gin.H{"error": "Invalid card ID"})
+			return
+		}
+
+		userID := c.MustGet("user_id").(int)
+		card, err := findBackupCardForUser(userID, cardID)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to resolve backup card"})
+			return
+		}
+		if card == nil {
+			c.JSON(404, gin.H{"error": "Backup card not found"})
+			return
+		}
+
+		profile, err := backups.GetBackupCardProfile(cardID)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to load backup card profile"})
+			return
+		}
+		if profile != nil {
+			allowed, err := canUseBackupCardProfile(c, profile)
+			if err != nil {
+				c.JSON(500, gin.H{"error": "Failed to validate backup card access"})
+				return
+			}
+			if !allowed {
+				c.JSON(403, gin.H{"error": "Access denied for this backup card"})
+				return
+			}
+		}
+
+		if err := backups.DeleteBackupCardProfile(cardID); err != nil {
+			c.JSON(500, gin.H{"error": "Failed to delete backup card profile"})
+			return
+		}
+		c.JSON(200, gin.H{"message": "Backup card deleted"})
 	})
 
 	// ========== PROJECTS API ==========
@@ -2032,6 +2661,9 @@ func main() {
 			c.JSON(400, gin.H{"error": "Invalid project ID"})
 			return
 		}
+		if !requireProjectAccess(c, projectID) {
+			return
+		}
 
 		// Only admins or users with edit_projects permission can manage users
 		if !requirePermission(c, db.PermissionEditProjects) {
@@ -2054,6 +2686,63 @@ func main() {
 		}
 
 		c.JSON(200, gin.H{"message": "Project users updated"})
+	})
+
+	r.DELETE("/api/projects/:id", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionCreateProjects) {
+			return
+		}
+
+		id := c.Param("id")
+		projectID, err := strconv.Atoi(id)
+		if err != nil || projectID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid project ID"})
+			return
+		}
+		if !requireProjectAccess(c, projectID) {
+			return
+		}
+
+		rows, err := db.DB.Query("SELECT id FROM databases WHERE project_id = ?", projectID)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to load project databases"})
+			return
+		}
+		defer rows.Close()
+
+		databaseIDs := []int{}
+		for rows.Next() {
+			var databaseID int
+			if err := rows.Scan(&databaseID); err != nil {
+				c.JSON(500, gin.H{"error": "Failed to scan project database"})
+				return
+			}
+			databaseIDs = append(databaseIDs, databaseID)
+		}
+
+		if len(databaseIDs) > 0 && !requireDeleteDatabasePermission(c) {
+			return
+		}
+
+		for _, databaseID := range databaseIDs {
+			if err := deleteDatabaseResources(databaseID); err != nil {
+				c.JSON(500, gin.H{"error": "Failed to delete project databases: " + err.Error()})
+				return
+			}
+		}
+
+		db.DB.Exec("DELETE FROM user_project_access WHERE project_id = ?", projectID)
+
+		if _, err := db.DB.Exec("DELETE FROM projects WHERE id = ?", projectID); err != nil {
+			c.JSON(500, gin.H{"error": "Failed to delete project"})
+			return
+		}
+
+		c.JSON(200, gin.H{
+			"message":          "Project deleted",
+			"projectId":        projectID,
+			"deletedDatabases": len(databaseIDs),
+		})
 	})
 
 	// Get databases for a project
@@ -2103,16 +2792,25 @@ func main() {
 		isAdmin := c.MustGet("is_admin").(bool)
 		userID := c.MustGet("user_id").(int)
 
-		query := "SELECT id, name, type, host, port, status, project_id FROM databases"
+		query := "SELECT id, name, type, host, port, status, COALESCE(project_id, 0), COALESCE(container_id, '') FROM databases"
 		args := []interface{}{}
 		if !isAdmin {
 			query = `
-				SELECT d.id, d.name, d.type, d.host, d.port, d.status, d.project_id
+				SELECT d.id, d.name, d.type, d.host, d.port, d.status,
+				       COALESCE(d.project_id, 0), COALESCE(d.container_id, '')
 				FROM databases d
-				INNER JOIN user_project_access upa ON upa.project_id = d.project_id
-				WHERE upa.user_id = ?
+				LEFT JOIN user_project_access upa
+					ON upa.project_id = d.project_id
+					AND upa.user_id = ?
+				WHERE (
+					COALESCE(d.project_id, 0) > 0
+					AND upa.user_id IS NOT NULL
+				) OR (
+					COALESCE(d.project_id, 0) = 0
+					AND d.owner_user_id = ?
+				)
 			`
-			args = append(args, userID)
+			args = append(args, userID, userID)
 		}
 
 		rows, err := db.DB.Query(query, args...)
@@ -2123,12 +2821,32 @@ func main() {
 		defer rows.Close()
 
 		databases := []map[string]interface{}{}
+		ctx := context.Background()
+		cli, dockerErr := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+		if dockerErr == nil {
+			defer cli.Close()
+		}
+
 		for rows.Next() {
 			var id, port, projectID int
-			var name, dbType, host, status string
-			if err := rows.Scan(&id, &name, &dbType, &host, &port, &status, &projectID); err != nil {
+			var name, dbType, host, status, containerID string
+			if err := rows.Scan(&id, &name, &dbType, &host, &port, &status, &projectID, &containerID); err != nil {
 				c.JSON(500, gin.H{"error": "Failed to scan database: " + err.Error()})
 				return
+			}
+
+			if dockerErr == nil && containerID != "" {
+				inspect, inspectErr := cli.ContainerInspect(ctx, containerID)
+				if inspectErr == nil && inspect.State != nil {
+					actualStatus := "stopped"
+					if inspect.State.Running {
+						actualStatus = "active"
+					}
+					if actualStatus != status {
+						status = actualStatus
+						_, _ = db.DB.Exec("UPDATE databases SET status = ? WHERE id = ?", status, id)
+					}
+				}
 			}
 
 			databases = append(databases, map[string]interface{}{
@@ -2307,7 +3025,7 @@ func main() {
 				NetworkMode: docker.NetworkName,
 				PortBindings: nat.PortMap{
 					"5432/tcp": []nat.PortBinding{
-						{HostIP: "0.0.0.0", HostPort: strconv.Itoa(freePort)},
+						{HostIP: getDatabaseHostBindIP(), HostPort: strconv.Itoa(freePort)},
 					},
 				},
 				Resources: container.Resources{
@@ -2340,8 +3058,8 @@ func main() {
 			// Store in DB
 			sendUpdate("finalizing", "Finalizing database setup...", 100, nil)
 			result, err := db.DB.Exec(
-				"INSERT INTO databases (name, type, host, port, mapped_port, container_id, version, password, status, project_id, max_cpu, max_ram_mb, max_storage_mb) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-				req.Name, req.Type, containerName, 5432, freePort, resp.ID, req.Version, password, "active", req.ProjectID, req.MaxCPU, req.MaxRAMMB, req.MaxStorageMB,
+				"INSERT INTO databases (name, type, host, port, mapped_port, container_id, version, password, status, project_id, owner_user_id, max_cpu, max_ram_mb, max_storage_mb) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				req.Name, req.Type, containerName, 5432, freePort, resp.ID, req.Version, password, "active", req.ProjectID, userID, req.MaxCPU, req.MaxRAMMB, req.MaxStorageMB,
 			)
 
 			if err != nil {
@@ -2350,19 +3068,25 @@ func main() {
 			}
 
 			databaseID, _ := result.LastInsertId()
+			if err := ensureDatabaseProxyAccessByID(ctx, cli, int(databaseID)); err != nil {
+				_, _ = db.DB.Exec("DELETE FROM databases WHERE id = ?", databaseID)
+				_ = cli.ContainerStop(ctx, resp.ID, container.StopOptions{})
+				_ = cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+				sendUpdate("error", "Failed to provision secure proxy database access: "+err.Error(), 0, nil)
+				return false
+			}
 
 			// Tokens and connection strings
 			tokenID, _ := auth.GenerateTokenID()
-			issuedAt := time.Now().UTC()
-			expiresAt := issuedAt.AddDate(2, 0, 0)
+			issuedAt, expiresAt := auth.NewProxyTokenWindow()
 			jwtToken, _ := auth.GenerateJWTWithTimestamps(int(databaseID), 0, tokenID, issuedAt, expiresAt)
 			tokenHash := db.HashToken(jwtToken)
 			db.CreateToken(int(databaseID), tokenID, tokenHash, issuedAt, expiresAt)
 
-			proxyHost := auth.GetProxyHost()
+			proxyHost := getClientProxyHost()
 			proxyPort := auth.GetProxyPort()
 			portInt, _ := strconv.Atoi(proxyPort)
-			connectionString := auth.GenerateConnectionString(jwtToken, int(databaseID), proxyHost, portInt, "require")
+			connectionString := auth.GenerateConnectionString(jwtToken, int(databaseID), proxyHost, portInt, recommendedProxySSLMode(proxyHost))
 
 			// Final success message with data
 			sendUpdate("success", "Database created successfully!", 100, gin.H{
@@ -2402,15 +3126,34 @@ func main() {
 			return
 		}
 
+		if containerID != "" {
+			ctx := context.Background()
+			cli, dockerErr := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+			if dockerErr == nil {
+				defer cli.Close()
+				inspect, inspectErr := cli.ContainerInspect(ctx, containerID)
+				if inspectErr == nil && inspect.State != nil {
+					actualStatus := "stopped"
+					if inspect.State.Running {
+						actualStatus = "active"
+					}
+					if actualStatus != status {
+						status = actualStatus
+						_, _ = db.DB.Exec("UPDATE databases SET status = ? WHERE id = ?", status, id)
+					}
+				}
+			}
+		}
+
 		// Get existing active token (don't regenerate on every fetch)
 		tokenRecord, _ := db.GetActiveTokenForDatabase(db_id)
 
-		proxyHost := auth.GetProxyHost()
+		proxyHost := getClientProxyHost()
 		proxyPort := auth.GetProxyPort()
 		portInt, _ := strconv.Atoi(proxyPort)
 
 		// Return censored connection string (actual token not exposed)
-		connectionString := auth.GenerateConnectionString("***CENSORED***", db_id, proxyHost, portInt, "require")
+		connectionString := auth.GenerateConnectionString("***CENSORED***", db_id, proxyHost, portInt, recommendedProxySSLMode(proxyHost))
 
 		response := gin.H{
 			"id":                db_id,
@@ -2425,6 +3168,20 @@ func main() {
 			"container_id":      containerID,
 		}
 
+		if containerID != "" {
+			ctx := context.Background()
+			cli, dockerErr := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+			if dockerErr == nil {
+				defer cli.Close()
+				if summary, summaryErr := getLegacyBindingSummaryForDatabase(ctx, cli, databaseID); summaryErr == nil {
+					response["has_legacy_public_bindings"] = summary.HasLegacyPublicBindings
+					response["legacy_public_database_binding"] = summary.DatabaseBindingExposed
+					response["legacy_public_branch_binding_count"] = summary.LegacyBranchBindingCount
+					response["legacy_public_binding_target_count"] = summary.LegacyBindingTargetCount
+				}
+			}
+		}
+
 		if tokenRecord != nil {
 			response["has_token"] = true
 			response["token_id"] = tokenRecord.TokenID
@@ -2437,6 +3194,113 @@ func main() {
 		c.JSON(200, response)
 	})
 
+	r.POST("/api/databases/:id/secure-legacy-bindings", func(c *gin.Context) {
+		id := c.Param("id")
+		databaseID, err := strconv.Atoi(id)
+		if err != nil || databaseID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+		if !requireDatabaseAccess(c, databaseID) {
+			return
+		}
+
+		ctx := context.Background()
+		cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to connect to Docker"})
+			return
+		}
+		defer cli.Close()
+
+		result, err := secureLegacyBindingsForDatabase(ctx, cli, databaseID)
+		if err != nil {
+			if result != nil {
+				c.JSON(500, gin.H{
+					"error":                    err.Error(),
+					"message":                  result.Message,
+					"migrated_count":           result.MigratedCount,
+					"database_migrated":        result.DatabaseMigrated,
+					"branches_migrated":        result.BranchesMigrated,
+					"remaining_legacy_targets": result.RemainingLegacyTargets,
+					"failures":                 result.Failures,
+				})
+				return
+			}
+			c.JSON(500, gin.H{"error": "Failed to secure legacy bindings: " + err.Error()})
+			return
+		}
+
+		c.JSON(200, result)
+	})
+
+	r.PUT("/api/databases/:id/project", func(c *gin.Context) {
+		if !requirePermission(c, db.PermissionCreateDatabases) {
+			return
+		}
+
+		id := c.Param("id")
+		databaseID, err := strconv.Atoi(id)
+		if err != nil || databaseID <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid database ID"})
+			return
+		}
+
+		if !requireDatabaseAccess(c, databaseID) {
+			return
+		}
+
+		var req struct {
+			ProjectID int `json:"projectId"`
+		}
+		if err := c.BindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid request"})
+			return
+		}
+
+		isAdmin := c.MustGet("is_admin").(bool)
+		userID := c.MustGet("user_id").(int)
+
+		if req.ProjectID > 0 {
+			var count int
+			if err := db.DB.QueryRow("SELECT COUNT(*) FROM projects WHERE id = ?", req.ProjectID).Scan(&count); err != nil {
+				c.JSON(500, gin.H{"error": "Failed to validate project"})
+				return
+			}
+			if count == 0 {
+				c.JSON(400, gin.H{"error": "Invalid project ID"})
+				return
+			}
+
+			if !isAdmin {
+				allowed, err := db.UserCanAccessProject(userID, req.ProjectID)
+				if err != nil {
+					c.JSON(500, gin.H{"error": "Failed to validate project access"})
+					return
+				}
+				if !allowed {
+					c.JSON(403, gin.H{"error": "Access denied for this project"})
+					return
+				}
+			}
+		}
+
+		if _, err := db.DB.Exec(
+			"UPDATE databases SET project_id = ? WHERE id = ?",
+			req.ProjectID,
+			databaseID,
+		); err != nil {
+			c.JSON(500, gin.H{"error": "Failed to update database project"})
+			return
+		}
+
+		c.JSON(200, gin.H{
+			"message":    "Database project updated",
+			"databaseId": databaseID,
+			"projectId":  req.ProjectID,
+		})
+	})
+
 	// Database Control Endpoints
 	r.POST("/api/databases/:id/:action", func(c *gin.Context) {
 		id := c.Param("id")
@@ -2447,6 +3311,9 @@ func main() {
 			return
 		}
 		if !requireDatabaseAccess(c, databaseID) {
+			return
+		}
+		if action == "delete" && !requireDeleteDatabasePermission(c) {
 			return
 		}
 
@@ -2471,6 +3338,10 @@ func main() {
 				c.JSON(500, gin.H{"error": "Failed to start container: " + err.Error()})
 				return
 			}
+			if err := ensureDatabaseProxyAccessByID(ctx, cli, databaseID); err != nil {
+				c.JSON(500, gin.H{"error": "Failed to provision secure proxy access: " + err.Error()})
+				return
+			}
 			db.DB.Exec("UPDATE databases SET status = 'active' WHERE id = ?", id)
 		case "stop":
 			if err := cli.ContainerStop(ctx, containerID, container.StopOptions{}); err != nil {
@@ -2481,6 +3352,10 @@ func main() {
 		case "restart":
 			if err := cli.ContainerRestart(ctx, containerID, container.StopOptions{}); err != nil {
 				c.JSON(500, gin.H{"error": "Failed to restart container: " + err.Error()})
+				return
+			}
+			if err := ensureDatabaseProxyAccessByID(ctx, cli, databaseID); err != nil {
+				c.JSON(500, gin.H{"error": "Failed to provision secure proxy access: " + err.Error()})
 				return
 			}
 			db.DB.Exec("UPDATE databases SET status = 'active' WHERE id = ?", id)
@@ -2508,19 +3383,9 @@ func main() {
 			c.JSON(200, gin.H{"message": "Database vacuumed successfully", "output": res.Output})
 			return
 		case "delete":
-			// Revoke all tokens first
 			dbID, _ := strconv.Atoi(id)
-			db.RevokeAllTokensForDatabase(dbID)
-
-			// Stop and remove main container
-			_ = cli.ContainerStop(ctx, containerID, container.StopOptions{})
-			_ = cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
-			// Delete tokens from DB
-			db.DB.Exec("DELETE FROM database_tokens WHERE database_id = ?", id)
-			// Delete from DB
-			_, err = db.DB.Exec("DELETE FROM databases WHERE id = ?", id)
-			if err != nil {
-				c.JSON(500, gin.H{"error": "Failed to delete database"})
+			if err := deleteDatabaseResources(dbID); err != nil {
+				c.JSON(500, gin.H{"error": "Failed to delete database: " + err.Error()})
 				return
 			}
 			c.JSON(200, gin.H{"message": "Database deleted"})
@@ -2678,7 +3543,7 @@ func main() {
 			NetworkMode: docker.NetworkName,
 			PortBindings: nat.PortMap{
 				"5432/tcp": []nat.PortBinding{
-					{HostIP: "0.0.0.0", HostPort: strconv.Itoa(freePort)},
+					{HostIP: getDatabaseHostBindIP(), HostPort: strconv.Itoa(freePort)},
 				},
 			},
 			SecurityOpt: []string{
@@ -3521,8 +4386,7 @@ func main() {
 			return
 		}
 
-		issuedAt := time.Now().UTC()
-		expiresAt := issuedAt.AddDate(2, 0, 0)
+		issuedAt, expiresAt := auth.NewProxyTokenWindow()
 		jwtToken, err := auth.GenerateJWTWithTimestamps(databaseID, 0, tokenID, issuedAt, expiresAt)
 		if err != nil {
 			c.JSON(500, gin.H{"error": "Failed to generate JWT token"})
@@ -3537,6 +4401,23 @@ func main() {
 			return
 		}
 		defer tx.Rollback()
+
+		rows, err := tx.Query("SELECT token_id FROM database_tokens WHERE database_id = ? AND revoked = 0", databaseID)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to load active tokens"})
+			return
+		}
+		oldTokenIDs := []string{}
+		for rows.Next() {
+			var existingTokenID string
+			if err := rows.Scan(&existingTokenID); err != nil {
+				rows.Close()
+				c.JSON(500, gin.H{"error": "Failed to scan active tokens"})
+				return
+			}
+			oldTokenIDs = append(oldTokenIDs, existingTokenID)
+		}
+		rows.Close()
 
 		if _, err := tx.Exec("UPDATE database_tokens SET revoked = 1 WHERE database_id = ? AND revoked = 0", databaseID); err != nil {
 			c.JSON(500, gin.H{"error": "Failed to revoke old token"})
@@ -3558,10 +4439,11 @@ func main() {
 		}
 
 		// Generate connection string
-		proxyHost := auth.GetProxyHost()
+		proxyHost := getClientProxyHost()
 		proxyPort := auth.GetProxyPort()
 		portInt, _ := strconv.Atoi(proxyPort)
-		connectionString := auth.GenerateConnectionString(jwtToken, databaseID, proxyHost, portInt, "require")
+		connectionString := auth.GenerateConnectionString(jwtToken, databaseID, proxyHost, portInt, recommendedProxySSLMode(proxyHost))
+		proxy.DisconnectTokens(oldTokenIDs)
 
 		c.JSON(200, gin.H{
 			"message":           "Token rotated successfully",
@@ -3587,6 +4469,7 @@ func main() {
 			c.JSON(404, gin.H{"error": "Token not found"})
 			return
 		}
+		proxy.DisconnectToken(tokenID)
 
 		c.JSON(200, gin.H{"message": "Token revoked successfully"})
 	})
@@ -3603,26 +4486,18 @@ func main() {
 			return
 		}
 
-		// TLS is mandatory for proxy connections.
-		sslMode := "require"
-
 		// Get existing active token
 		tokenRecord, err := db.GetActiveTokenForDatabase(dbID)
 		if err != nil || tokenRecord == nil {
 			// Generate new token if none exists
 			tokenID, _ := auth.GenerateTokenID()
-			issuedAt := time.Now().UTC()
-			expiresAt := issuedAt.AddDate(2, 0, 0)
+			issuedAt, expiresAt := auth.NewProxyTokenWindow()
 			jwtToken, _ := auth.GenerateJWTWithTimestamps(dbID, 0, tokenID, issuedAt, expiresAt)
 			tokenHash := db.HashToken(jwtToken)
 			db.CreateToken(dbID, tokenID, tokenHash, issuedAt, expiresAt)
 
-			proxyHost := auth.GetProxyHost()
-			if proxyHost == "localhost" || proxyHost == "0.0.0.0" {
-				if publicIP, err := system.GetPublicIP(); err == nil {
-					proxyHost = publicIP
-				}
-			}
+			proxyHost := getClientProxyHost()
+			sslMode := recommendedProxySSLMode(proxyHost)
 			proxyPort := auth.GetProxyPort()
 			portInt, _ := strconv.Atoi(proxyPort)
 			connectionString := auth.GenerateConnectionString(jwtToken, dbID, proxyHost, portInt, sslMode)
@@ -3646,8 +4521,7 @@ func main() {
 		if db.HashToken(jwtToken) != tokenRecord.TokenHash {
 			// Legacy token record without reproducible JWT claims; mint a new stable token.
 			tokenID, _ := auth.GenerateTokenID()
-			issuedAt := time.Now().UTC()
-			expiresAt := issuedAt.AddDate(2, 0, 0)
+			issuedAt, expiresAt := auth.NewProxyTokenWindow()
 			jwtToken, _ = auth.GenerateJWTWithTimestamps(dbID, 0, tokenID, issuedAt, expiresAt)
 			tokenHash := db.HashToken(jwtToken)
 			if _, err := db.CreateToken(dbID, tokenID, tokenHash, issuedAt, expiresAt); err != nil {
@@ -3657,12 +4531,8 @@ func main() {
 			tokenRecord.ExpiresAt = expiresAt
 		}
 
-		proxyHost := auth.GetProxyHost()
-		if proxyHost == "localhost" || proxyHost == "0.0.0.0" {
-			if publicIP, err := system.GetPublicIP(); err == nil {
-				proxyHost = publicIP
-			}
-		}
+		proxyHost := getClientProxyHost()
+		sslMode := recommendedProxySSLMode(proxyHost)
 		proxyPort := auth.GetProxyPort()
 		portInt, _ := strconv.Atoi(proxyPort)
 		connectionString := auth.GenerateConnectionString(jwtToken, dbID, proxyHost, portInt, sslMode)
@@ -4203,8 +5073,8 @@ func main() {
 			// Filter the containers slice
 			var filtered []docker.ContainerInfo
 			for _, ctr := range containers {
-				projectID := ctr.Labels["baseful.project_id"]
-				if allowedIDs[projectID] {
+				projectID := resolveContainerProjectID(ctr)
+				if projectID > 0 && allowedIDs[strconv.Itoa(projectID)] {
 					filtered = append(filtered, ctr)
 				}
 			}
@@ -4215,6 +5085,9 @@ func main() {
 			return
 		}
 
+		if containers == nil {
+			containers = []docker.ContainerInfo{}
+		}
 		c.JSON(200, containers)
 	})
 
@@ -4229,20 +5102,19 @@ func main() {
 			return false, "Failed to inspect container"
 		}
 
-		var projectID string
+		var projectID int
 		for _, ctr := range containers {
 			if ctr.ID == containerID {
-				projectID = ctr.Labels["baseful.project_id"]
+				projectID = resolveContainerProjectID(ctr)
 				break
 			}
 		}
-		if projectID == "" {
+		if projectID <= 0 {
 			return false, "Access denied: container has no associated project"
 		}
 
-		pid, _ := strconv.Atoi(projectID)
 		userID := c.MustGet("user_id").(int)
-		canAccess, err := db.UserCanAccessProject(userID, pid)
+		canAccess, err := db.UserCanAccessProject(userID, projectID)
 		if err != nil || !canAccess {
 			return false, "Access denied: insufficient project permissions"
 		}
@@ -4252,6 +5124,9 @@ func main() {
 	// Execute command in container
 	r.POST("/api/docker/containers/:id/exec", func(c *gin.Context) {
 		if !requirePermission(c, db.PermissionServerAccess) {
+			return
+		}
+		if !requireContainerExecPermission(c) {
 			return
 		}
 		id := c.Param("id")

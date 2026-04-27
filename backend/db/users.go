@@ -32,6 +32,9 @@ const (
 	PermissionCreateProjects      = "create_projects"
 	PermissionEditProjects        = "edit_projects"
 	PermissionCreateDatabases     = "create_databases"
+	PermissionManageBackups       = "manage_backups"
+	PermissionDeleteDatabases     = "delete_databases"
+	PermissionContainerExec       = "container_exec"
 )
 
 var AvailablePermissionKeys = []string{
@@ -40,6 +43,9 @@ var AvailablePermissionKeys = []string{
 	PermissionCreateProjects,
 	PermissionEditProjects,
 	PermissionCreateDatabases,
+	PermissionManageBackups,
+	PermissionDeleteDatabases,
+	PermissionContainerExec,
 }
 
 // CreateUser creates a new user in the database
@@ -359,6 +365,7 @@ func UserCanAccessProject(userID, projectID int) (bool, error) {
 }
 
 // UserCanAccessDatabase checks if a user can access a database via project access
+// or, for unassigned databases, as the creating owner.
 func UserCanAccessDatabase(userID, databaseID int) (bool, error) {
 	if databaseID <= 0 {
 		return false, nil
@@ -368,9 +375,15 @@ func UserCanAccessDatabase(userID, databaseID int) (bool, error) {
 	err := DB.QueryRow(`
 		SELECT COUNT(*)
 		FROM databases d
-		INNER JOIN user_project_access upa ON upa.project_id = d.project_id
-		WHERE d.id = ? AND upa.user_id = ?
-	`, databaseID, userID).Scan(&count)
+		LEFT JOIN user_project_access upa
+			ON upa.project_id = d.project_id
+			AND upa.user_id = ?
+		WHERE d.id = ?
+		  AND (
+			(COALESCE(d.project_id, 0) > 0 AND upa.user_id IS NOT NULL)
+			OR (COALESCE(d.project_id, 0) = 0 AND d.owner_user_id = ?)
+		  )
+	`, userID, databaseID, userID).Scan(&count)
 	if err != nil {
 		return false, err
 	}

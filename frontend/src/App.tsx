@@ -1,4 +1,10 @@
-import { BrowserRouter as Router, Routes, Route } from "react-router-dom";
+import {
+  BrowserRouter as Router,
+  Navigate,
+  Route,
+  Routes,
+  useParams,
+} from "react-router-dom";
 import Home from "./pages/Home";
 import About from "./pages/About";
 import DatabaseDetail from "./pages/DatabaseDetail";
@@ -27,7 +33,20 @@ import { ThemeProvider } from "./components/theme-provider";
 import { DatabaseProvider } from "./context/DatabaseContext";
 import { ProjectProvider } from "./context/ProjectContext";
 import { AuthProvider } from "./context/AuthContext";
+import { useAuth } from "./context/AuthContext";
 import AuthGuard from "./components/auth/AuthGuard";
+
+function BackupRoute() {
+  const { id } = useParams<{ id: string }>();
+  const { user, hasPermission } = useAuth();
+  const canManageBackups = user?.isAdmin || hasPermission("manage_backups");
+
+  if (!canManageBackups) {
+    return <Navigate to={id ? `/db/${id}/dashboard` : "/"} replace />;
+  }
+
+  return <Backup />;
+}
 
 function App() {
   return (
@@ -127,7 +146,7 @@ function App() {
                               />
                               <Route
                                 path="/db/:id/backup"
-                                element={<Backup />}
+                                element={<BackupRoute />}
                               />
                               <Route
                                 path="/db/:id/security"

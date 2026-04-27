@@ -16,20 +16,31 @@ import { useAuth } from "@/context/AuthContext";
 import { authFetch } from "@/lib/api";
 
 interface CreateProjectDialogProps {
-  onProjectCreated: () => void;
+  onProjectCreated: (project?: {
+    id: number;
+    name: string;
+    description?: string;
+  }) => void;
   children?: React.ReactNode;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 }
 
 export default function CreateProjectDialog({
   onProjectCreated,
   children,
+  open: controlledOpen,
+  onOpenChange: controlledOnOpenChange,
 }: CreateProjectDialogProps) {
   const { token, logout } = useAuth();
-  const [open, setOpen] = useState(false);
+  const [internalOpen, setInternalOpen] = useState(false);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const open = controlledOpen ?? internalOpen;
+  const setOpen = controlledOnOpenChange ?? setInternalOpen;
+  const shouldRenderTrigger = Boolean(children) || controlledOpen === undefined;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -50,10 +61,11 @@ export default function CreateProjectDialog({
         throw new Error(data.error || "Failed to create project");
       }
 
+      const createdProject = await response.json();
       setName("");
       setDescription("");
       setOpen(false);
-      onProjectCreated();
+      onProjectCreated(createdProject);
     } catch (error: any) {
       setError(error.message);
       console.error("Error creating project:", error);
@@ -64,13 +76,15 @@ export default function CreateProjectDialog({
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        {children || (
-          <Button variant="ghost" size="sm" className="cursor-pointer">
-            <FolderPlusIcon size={16} />
-          </Button>
-        )}
-      </DialogTrigger>
+      {shouldRenderTrigger ? (
+        <DialogTrigger asChild>
+          {children || (
+            <Button variant="ghost" size="sm" className="cursor-pointer">
+              <FolderPlusIcon size={16} />
+            </Button>
+          )}
+        </DialogTrigger>
+      ) : null}
       <DialogContent className="p-0 gap-0! bg-card">
         <DialogHeader className="border-b border-border p-4 mb-0! gap-0">
           <DialogTitle className="text-xl font-medium">Create Project</DialogTitle>

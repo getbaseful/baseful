@@ -3,6 +3,7 @@ package proxy
 import (
 	"baseful/auth"
 	"baseful/db"
+	"baseful/security"
 	"baseful/system"
 	"bytes"
 	"context"
@@ -20,6 +21,8 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,6 +42,9 @@ const (
 	MaxConnectionDuration = 24 * time.Hour   // Maximum connection lifetime
 	TokenCheckInterval    = 5 * time.Minute  // How often to check token revocation
 	SSLHandshakeTimeout   = 10 * time.Second // SSL/TLS handshake timeout
+	DefaultMaxConnections = 500
+	DefaultMaxConnPerIP   = 25
+	DefaultConnRatePerMin = 120
 )
 
 type ProxyConfig struct {
@@ -49,19 +55,25 @@ type ProxyConfig struct {
 	EnableSSL         bool
 	CertFile          string
 	KeyFile           string
+	MaxConnections    int
+	MaxConnectionsIP  int
+	ConnRatePerMinute int
 	Logger            *Logger
 }
 
 type ProxyServer struct {
-	listener    net.Listener
-	port        int
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
-	config      *ProxyConfig
-	tlsConfig   *tls.Config
-	activeConns sync.Map
-	logger      *Logger
+	listener       net.Listener
+	port           int
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	config         *ProxyConfig
+	tlsConfig      *tls.Config
+	logger         *Logger
+	connectionSlot chan struct{}
+	activeByIPMu   sync.Mutex
+	activeByIP     map[string]int
+	connectLimiter *security.FixedWindowLimiter
 }
 
 func NewProxyServer(config *ProxyConfig) *ProxyServer {
@@ -77,30 +89,45 @@ func NewProxyServer(config *ProxyConfig) *ProxyServer {
 	if config.MaxConnectionTime == 0 {
 		config.MaxConnectionTime = MaxConnectionDuration
 	}
+	if config.MaxConnections == 0 {
+		config.MaxConnections = DefaultMaxConnections
+	}
+	if config.MaxConnectionsIP == 0 {
+		config.MaxConnectionsIP = DefaultMaxConnPerIP
+	}
+	if config.ConnRatePerMinute == 0 {
+		config.ConnRatePerMinute = DefaultConnRatePerMin
+	}
 	if config.Logger == nil {
 		config.Logger = GetLogger()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	return &ProxyServer{
-		port:   config.Port,
-		ctx:    ctx,
-		cancel: cancel,
-		config: config,
-		logger: config.Logger,
+		port:           config.Port,
+		ctx:            ctx,
+		cancel:         cancel,
+		config:         config,
+		logger:         config.Logger,
+		connectionSlot: make(chan struct{}, config.MaxConnections),
+		activeByIP:     make(map[string]int),
+		connectLimiter: security.NewFixedWindowLimiter(config.ConnRatePerMinute, time.Minute),
 	}
 }
 
 // ConnectionMetadata stores metadata about an active connection
 type ConnectionMetadata struct {
-	ID          string
-	ClientIP    string
-	DatabaseID  int
-	TokenID     string
-	ConnectedAt time.Time
-	LastActive  time.Time
-	BytesSent   int64
-	BytesRecv   int64
+	ID           string
+	ClientIP     string
+	DatabaseID   int
+	TokenID      string
+	ConnectedAt  time.Time
+	LastActive   time.Time
+	BytesSent    int64
+	BytesRecv    int64
+	frontendConn net.Conn
+	backendConn  net.Conn
+	closeOnce    sync.Once
 }
 
 func (p *ProxyServer) Start() error {
@@ -128,6 +155,9 @@ func (p *ProxyServer) Start() error {
 	go p.idleConnectionChecker()
 
 	p.wg.Add(1)
+	go p.connectionStateChecker()
+
+	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
 		for {
@@ -143,11 +173,27 @@ func (p *ProxyServer) Start() error {
 			}
 
 			// Get client IP for logging
-			clientIP := conn.RemoteAddr().String()
+			clientIP := normalizeRemoteIP(conn.RemoteAddr().String())
+			if !p.connectLimiter.Allow(clientIP) {
+				p.logger.Warning("Connection rate limit exceeded", &ConnectionInfo{
+					RemoteIP:  clientIP,
+					LocalPort: p.port,
+				}, nil, nil)
+				conn.Close()
+				continue
+			}
+			if !p.acquireConnectionSlot(clientIP) {
+				p.logger.Warning("Connection rejected due to concurrency limits", &ConnectionInfo{
+					RemoteIP:  clientIP,
+					LocalPort: p.port,
+				}, nil, nil)
+				conn.Close()
+				continue
+			}
 			p.logger.ConnectionStarted(clientIP, 0, p.port)
 
 			p.wg.Add(1)
-			go p.handleConnection(conn)
+			go p.handleConnection(conn, clientIP)
 		}
 	}()
 	return nil
@@ -162,19 +208,29 @@ func (p *ProxyServer) setupTLS() error {
 	if p.config.CertFile != "" && p.config.KeyFile != "" {
 		cert, err = tls.LoadX509KeyPair(p.config.CertFile, p.config.KeyFile)
 		if err != nil {
-			// Generate self-signed certificate if not found
-			p.logger.Warning("Failed to load certificate, generating self-signed", nil, nil, nil)
+			expectedHost := getExpectedTLSHost()
+			if !isLocalDevelopmentHost(expectedHost) {
+				return fmt.Errorf("failed to load configured certificate for public proxy host %s: %w", expectedHost, err)
+			}
+			p.logger.Warning("Failed to load certificate, generating self-signed for local development", nil, nil, nil)
 			cert, err = p.generateSelfSignedCert()
 			if err != nil {
 				return err
 			}
 		}
 	} else {
-		// Generate self-signed certificate
+		expectedHost := getExpectedTLSHost()
+		if !isLocalDevelopmentHost(expectedHost) {
+			return fmt.Errorf("public proxy TLS requires a configured certificate for %s", expectedHost)
+		}
 		cert, err = p.generateSelfSignedCert()
 		if err != nil {
 			return err
 		}
+	}
+
+	if err := validateTLSCertificateForHost(cert, getExpectedTLSHost()); err != nil {
+		return err
 	}
 
 	p.tlsConfig = &tls.Config{
@@ -248,7 +304,7 @@ func (p *ProxyServer) idleConnectionChecker() {
 			return
 		case <-ticker.C:
 			now := time.Now()
-			p.activeConns.Range(func(key, value interface{}) bool {
+			activeConns.Range(func(key, value interface{}) bool {
 				connID := key.(string)
 				meta := value.(*ConnectionMetadata)
 
@@ -260,7 +316,8 @@ func (p *ProxyServer) idleConnectionChecker() {
 						DatabaseID: meta.DatabaseID,
 						Duration:   idleTime.Milliseconds(),
 					}, idleTime)
-					p.activeConns.Delete(connID)
+					meta.Close()
+					activeConns.Delete(connID)
 				}
 				return true
 			})
@@ -268,12 +325,12 @@ func (p *ProxyServer) idleConnectionChecker() {
 	}
 }
 
-func (p *ProxyServer) handleConnection(frontend net.Conn) {
+func (p *ProxyServer) handleConnection(frontend net.Conn, clientIP string) {
 	defer p.wg.Done()
 	defer frontend.Close()
+	defer p.releaseConnectionSlot(clientIP)
 
 	connID := uuid.New().String()
-	clientIP := frontend.RemoteAddr().String()
 
 	// Track connection metadata
 	connMeta := &ConnectionMetadata{
@@ -432,7 +489,9 @@ func (p *ProxyServer) handleConnection(frontend net.Conn) {
 	frontend.SetDeadline(time.Time{})
 
 	// Store connection metadata
-	p.activeConns.Store(connID, connMeta)
+	connMeta.frontendConn = frontend
+	connMeta.backendConn = backend
+	activeConns.Store(connID, connMeta)
 	p.logger.ConnectionAuthenticated(&ConnectionInfo{
 		RemoteIP:   clientIP,
 		RemotePort: 0,
@@ -463,7 +522,7 @@ func (p *ProxyServer) handleConnection(frontend net.Conn) {
 	}, duration, connMeta.BytesSent, connMeta.BytesRecv)
 
 	// Remove from active connections
-	p.activeConns.Delete(connID)
+	activeConns.Delete(connID)
 }
 
 func (p *ProxyServer) handleFrontendHandshake(conn net.Conn) (net.Conn, map[string]string, string, error) {
@@ -559,12 +618,16 @@ func (p *ProxyServer) handleFrontendHandshake(conn net.Conn) (net.Conn, map[stri
 }
 
 func (p *ProxyServer) handleBackendHandshake(backend net.Conn, dbInfo *db.DatabaseInfo, params map[string]string, frontend net.Conn) error {
+	if strings.TrimSpace(dbInfo.ProxyUser) == "" || strings.TrimSpace(dbInfo.ProxyPass) == "" {
+		return fmt.Errorf("database proxy access is not provisioned")
+	}
+
 	// 1. Send Startup to Backend
 	var buf bytes.Buffer
 	binary.Write(&buf, binary.BigEndian, uint32(196608)) // Protocol 3.0
 	for k, v := range params {
 		if k == "user" {
-			v = "postgres"
+			v = dbInfo.ProxyUser
 		} // Force backend user
 		if k == "database" {
 			v = dbInfo.Name // Use the actual database name stored in DB
@@ -597,19 +660,19 @@ func (p *ProxyServer) handleBackendHandshake(backend net.Conn, dbInfo *db.Databa
 				continue
 			}
 			if authType == 3 { // Cleartext requested
-				resp := append([]byte{'p'}, uint32ToBytes(uint32(len(dbInfo.Password)+5))...)
-				resp = append(resp, []byte(dbInfo.Password)...)
+				resp := append([]byte{'p'}, uint32ToBytes(uint32(len(dbInfo.ProxyPass)+5))...)
+				resp = append(resp, []byte(dbInfo.ProxyPass)...)
 				resp = append(resp, 0)
 				backend.Write(resp)
 			} else if authType == 5 { // MD5 requested
 				salt := payload[4:8]
-				digest := md5Hash(dbInfo.Password, "postgres", salt)
+				digest := md5Hash(dbInfo.ProxyPass, dbInfo.ProxyUser, salt)
 				resp := append([]byte{'p'}, uint32ToBytes(uint32(len(digest)+5))...)
 				resp = append(resp, []byte(digest)...)
 				resp = append(resp, 0)
 				backend.Write(resp)
 			} else if authType == 10 { // SASL (SCRAM-SHA-256) requested
-				if err := p.handleSCRAMAuth(backend, payload[4:], dbInfo.Password); err != nil {
+				if err := p.handleSCRAMAuth(backend, payload[4:], dbInfo.ProxyUser, dbInfo.ProxyPass); err != nil {
 					return err
 				}
 			} else {
@@ -674,12 +737,7 @@ func (p *ProxyServer) pipeWithIdleTracking(dst, src net.Conn, meta *ConnectionMe
 
 // checkTokenRevocation verifies the token hasn't been revoked
 func (p *ProxyServer) checkTokenRevocation(tokenID string) error {
-	// Check against revoked tokens cache
-	// In production, this would query the database or a Redis cache
-	revokedTokensMu.RLock()
-	defer revokedTokensMu.RUnlock()
-
-	if _, revoked := revokedTokens[tokenID]; revoked {
+	if IsTokenRevoked(tokenID) {
 		return fmt.Errorf("token %s has been revoked", tokenID)
 	}
 
@@ -744,6 +802,18 @@ func Run() error {
 		EnableSSL:         true, // Always enable SSL support if certificates are found
 		CertFile:          os.Getenv("PROXY_CERT_FILE"),
 		KeyFile:           os.Getenv("PROXY_KEY_FILE"),
+		MaxConnections:    DefaultMaxConnections,
+		MaxConnectionsIP:  DefaultMaxConnPerIP,
+		ConnRatePerMinute: DefaultConnRatePerMin,
+	}
+
+	if config.CertFile == "" {
+		if _, err := os.Stat("/app/server.crt"); err == nil {
+			if _, keyErr := os.Stat("/app/server.key"); keyErr == nil {
+				config.CertFile = "/app/server.crt"
+				config.KeyFile = "/app/server.key"
+			}
+		}
 	}
 
 	// Auto-detect Caddy certificates if domain is set
@@ -771,6 +841,21 @@ func Run() error {
 	if timeoutStr := os.Getenv("PROXY_IDLE_TIMEOUT"); timeoutStr != "" {
 		if duration, err := time.ParseDuration(timeoutStr); err == nil {
 			config.IdleTimeout = duration
+		}
+	}
+	if maxConnStr := strings.TrimSpace(os.Getenv("PROXY_MAX_CONNECTIONS")); maxConnStr != "" {
+		if parsed, err := strconv.Atoi(maxConnStr); err == nil && parsed > 0 {
+			config.MaxConnections = parsed
+		}
+	}
+	if maxPerIPStr := strings.TrimSpace(os.Getenv("PROXY_MAX_CONNECTIONS_PER_IP")); maxPerIPStr != "" {
+		if parsed, err := strconv.Atoi(maxPerIPStr); err == nil && parsed > 0 {
+			config.MaxConnectionsIP = parsed
+		}
+	}
+	if rateStr := strings.TrimSpace(os.Getenv("PROXY_CONNECTION_RATE_PER_MINUTE")); rateStr != "" {
+		if parsed, err := strconv.Atoi(rateStr); err == nil && parsed > 0 {
+			config.ConnRatePerMinute = parsed
 		}
 	}
 

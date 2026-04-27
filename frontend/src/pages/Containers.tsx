@@ -1,15 +1,31 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   ArrowClockwiseIcon,
+  ClockCounterClockwiseIcon,
   CubeIcon,
+  DatabaseIcon,
+  FolderPlusIcon,
   GlobeIcon,
+  HardDrivesIcon,
+  ShieldStarIcon,
   TerminalIcon,
   TerminalWindowIcon,
+  TrashIcon,
+  UploadIcon,
 } from "@phosphor-icons/react";
 import {
+  applyNodeChanges,
   BaseEdge,
   Background,
   BackgroundVariant,
+  type Connection,
   ConnectionLineType,
   Handle,
   MarkerType,
@@ -18,20 +34,30 @@ import {
   type Edge,
   type EdgeProps,
   type Node,
+  type NodeChange,
   type NodeMouseHandler,
   type NodeProps,
   type ReactFlowInstance,
   type Viewport,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
+import { useNavigate } from "react-router-dom";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuLabel,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
   DialogTrigger,
@@ -43,10 +69,23 @@ import {
   DrawerHeader,
   DrawerTitle,
 } from "@/components/ui/drawer";
-import { Skeleton } from "@/components/ui/skeleton";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import CreateDatabaseDialog from "@/components/database/CreateDatabaseDialog";
 import { useAuth } from "@/context/AuthContext";
+import { useDatabase } from "@/context/DatabaseContext";
+import { useProject } from "@/context/ProjectContext";
 import { authFetch } from "@/lib/api";
 import { ManageProjectDialog } from "@/components/ManageProjectDialog";
+import CreateProjectDialog from "@/components/project/CreateProjectDialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { DitherAvatar } from "@/components/ui/hash-avatar";
 import { LetterAvatar } from "@/components/ui/letter-avatar";
 import { UserManagementPanel } from "@/components/users/UserManagementPanel";
@@ -81,7 +120,56 @@ interface ProxyInfo {
   host: string;
 }
 
-type GraphKind = "internet" | "project" | "service" | "container" | "network";
+interface DatabaseInfo {
+  id: number;
+  name: string;
+  projectId: number;
+  status: string;
+  type: string;
+}
+
+interface BackupSettingsInfo {
+  database_id: number;
+  enabled: boolean;
+  provider: string;
+  endpoint: string;
+  region: string;
+  bucket: string;
+  access_key: string;
+  secret_key: string;
+  has_access_key?: boolean;
+  has_secret_key?: boolean;
+  path_prefix: string;
+  automation_enabled: boolean;
+  automation_frequency: string;
+  encryption_enabled: boolean;
+  encryption_public_key: string;
+}
+
+interface BackupCardInfo {
+  id: string;
+  label: string;
+  config: BackupSettingsInfo;
+  databaseId?: number | null;
+}
+
+interface AutomationCardInfo {
+  id: string;
+  label: string;
+  automation_enabled: boolean;
+  automation_frequency: string;
+  databaseId?: number | null;
+  backupCardId?: string | null;
+}
+
+type GraphKind =
+  | "internet"
+  | "project"
+  | "service"
+  | "container"
+  | "network"
+  | "automation"
+  | "backup";
 
 interface GraphNode {
   id: string;
@@ -95,6 +183,17 @@ interface GraphNode {
   ip?: string;
   status?: string;
   count?: number;
+  connectedContainers?: string[];
+  projectCount?: number;
+  networkRole?: string;
+  databaseId?: number;
+  databaseName?: string;
+  backupProvider?: string;
+  backupBucket?: string;
+  backupEndpoint?: string;
+  backupPathPrefix?: string;
+  backupEncryptionEnabled?: boolean;
+  automationFrequency?: string;
   isSimulated?: boolean;
   x: number;
   y: number;
@@ -104,7 +203,7 @@ interface GraphEdge {
   id: string;
   source: string;
   target: string;
-  kind: "belongs" | "exposes" | "route";
+  kind: "belongs" | "exposes" | "route" | "backup";
 }
 
 interface TopologyNodeData extends Record<string, unknown> {
@@ -114,6 +213,13 @@ interface TopologyNodeData extends Record<string, unknown> {
   outboundRouteCount: number;
   hasIncoming: boolean;
   hasOutgoing: boolean;
+  hasIncomingRoute: boolean;
+  hasOutgoingRoute: boolean;
+  canAttachProjectConnection: boolean;
+  canAcceptIncomingConnection: boolean;
+  canStartOutgoingConnection: boolean;
+  canDelete: boolean;
+  canOpenBackupPage: boolean;
   containerMatch?: ContainerInfo;
   actionLoading?: "start" | "stop" | "restart" | "logs";
   isAdmin: boolean;
@@ -123,8 +229,11 @@ interface TopologyNodeData extends Record<string, unknown> {
   onContainerAction: (
     container: ContainerInfo,
     action: "start" | "stop" | "restart",
+    databaseId?: number,
   ) => void;
   onOpenProxyLogs: () => void;
+  onOpenBackupPage: (databaseId: number) => void;
+  onRequestDelete: (node: GraphNode) => void;
 }
 
 type TopologyFlowNode = Node<TopologyNodeData, "topologyNode">;
@@ -152,30 +261,420 @@ const BASEFUL_SIMULATED_ID = "local-baseful-simulated";
 const DEFAULT_CARD_WIDTH = 220;
 const CONTAINER_CARD_WIDTH = 276;
 const INTERNET_CARD_WIDTH = 232;
+const NETWORK_CARD_WIDTH = 256;
+const AUTOMATION_CARD_WIDTH = 214;
+const BACKUP_CARD_WIDTH = 280;
 const DEFAULT_CARD_HEIGHT = 150;
 const CONTAINER_CARD_HEIGHT = 186;
 const SERVICE_CARD_HEIGHT = 188;
 const INTERNET_CARD_HEIGHT = 164;
+const NETWORK_CARD_HEIGHT = 188;
+const AUTOMATION_CARD_HEIGHT = 148;
+const BACKUP_CARD_HEIGHT = 224;
 const MAX_RENDERED_TERMINAL_LINES = 1200;
 const MAX_RENDERED_LOG_CHARS = 300000;
 const MAX_RENDERED_LOG_LINES = 4000;
+const NODE_POSITION_STORAGE_KEY = "baseful.containers.node-positions.v1";
+const VIEWPORT_STORAGE_KEY = "baseful.containers.viewport.v1";
+const DEFAULT_VIEWPORT: Viewport = {
+  x: 0,
+  y: 0,
+  zoom: 1,
+};
+
+type NodeCenterPosition = { x: number; y: number };
+type CreateEntityKind = "project" | "database" | "backup" | "automation";
+type ServiceCardsPayload = {
+  backupCards: BackupCardInfo[];
+  automationCards: AutomationCardInfo[];
+};
+
+function createId(prefix: string) {
+  return `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function buildScopedStorageKey(baseKey: string, userId?: number | null) {
+  if (typeof window === "undefined") {
+    return `${baseKey}:server:unknown:user:${userId ?? "anonymous"}`;
+  }
+
+  return `${baseKey}:server:${window.location.host}:user:${userId ?? "anonymous"}`;
+}
+
+function normalizeServiceCardsPayload(
+  payload: Partial<ServiceCardsPayload> | null | undefined,
+): ServiceCardsPayload {
+  return {
+    backupCards: Array.isArray(payload?.backupCards) ? payload.backupCards : [],
+    automationCards: Array.isArray(payload?.automationCards)
+      ? payload.automationCards
+      : [],
+  };
+}
+
+function serializeServiceCardsPayload(payload: ServiceCardsPayload): string {
+  return JSON.stringify({
+    backupCards: payload.backupCards,
+    automationCards: payload.automationCards,
+  });
+}
+
+function loadStoredNodePositions(): Record<string, NodeCenterPosition> {
+  if (typeof window === "undefined") {
+    return {};
+  }
+
+  try {
+    const raw = window.localStorage.getItem(NODE_POSITION_STORAGE_KEY);
+    if (!raw) {
+      return {};
+    }
+
+    const parsed = JSON.parse(raw) as Record<string, NodeCenterPosition>;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function persistNodePositions(positions: Record<string, NodeCenterPosition>) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  window.localStorage.setItem(
+    NODE_POSITION_STORAGE_KEY,
+    JSON.stringify(positions),
+  );
+}
+
+function loadStoredViewport(storageKey: string): Viewport | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  try {
+    const raw = window.localStorage.getItem(storageKey);
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(raw) as Partial<Viewport>;
+    if (
+      typeof parsed?.x !== "number" ||
+      typeof parsed?.y !== "number" ||
+      typeof parsed?.zoom !== "number"
+    ) {
+      return null;
+    }
+
+    return {
+      x: parsed.x,
+      y: parsed.y,
+      zoom: parsed.zoom,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function persistViewport(storageKey: string, viewport: Viewport) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  window.localStorage.setItem(storageKey, JSON.stringify(viewport));
+}
+
+function clearStoredViewport(storageKey: string) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  window.localStorage.removeItem(storageKey);
+}
+
+function createDefaultBackupSettings(databaseId: number): BackupSettingsInfo {
+  return {
+    database_id: databaseId,
+    enabled: false,
+    provider: "s3",
+    endpoint: "",
+    region: "us-east-1",
+    bucket: "",
+    access_key: "",
+    secret_key: "",
+    has_access_key: false,
+    has_secret_key: false,
+    path_prefix: "/baseful/backups",
+    automation_enabled: false,
+    automation_frequency: "daily",
+    encryption_enabled: false,
+    encryption_public_key: "",
+  };
+}
+
+function normalizeStoredServiceCards(
+  payload: ServiceCardsPayload,
+  backupSettingsByDatabaseId: Record<number, BackupSettingsInfo>,
+  databases: DatabaseInfo[],
+): ServiceCardsPayload {
+  const databaseIds = new Set(databases.map((database) => database.id));
+  const normalizedBackupCards: BackupCardInfo[] = [];
+  const normalizedAutomationCards: AutomationCardInfo[] = [];
+  const seenBackupIds = new Set<string>();
+  const seenAutomationIds = new Set<string>();
+  const attachedBackupDatabaseIds = new Set<number>();
+  const attachedAutomationDatabaseIds = new Set<number>();
+
+  payload.backupCards.forEach((card) => {
+    if (!card?.id || seenBackupIds.has(card.id)) {
+      return;
+    }
+
+    if (card.databaseId == null) {
+      normalizedBackupCards.push(card);
+      seenBackupIds.add(card.id);
+      return;
+    }
+
+    if (
+      !databaseIds.has(card.databaseId) ||
+      !backupSettingsByDatabaseId[card.databaseId]?.enabled ||
+      attachedBackupDatabaseIds.has(card.databaseId)
+    ) {
+      return;
+    }
+
+    normalizedBackupCards.push(card);
+    seenBackupIds.add(card.id);
+    attachedBackupDatabaseIds.add(card.databaseId);
+  });
+
+  const normalizedBackupIds = new Set(
+    normalizedBackupCards.map((card) => card.id),
+  );
+  const attachedBackupCardIdByDatabaseId = normalizedBackupCards.reduce(
+    (acc, card) => {
+      if (card.databaseId != null) {
+        acc[card.databaseId] = card.id;
+      }
+      return acc;
+    },
+    {} as Record<number, string>,
+  );
+
+  payload.automationCards.forEach((card) => {
+    if (!card?.id || seenAutomationIds.has(card.id)) {
+      return;
+    }
+
+    if (card.databaseId == null) {
+      normalizedAutomationCards.push({
+        ...card,
+        backupCardId:
+          card.backupCardId && normalizedBackupIds.has(card.backupCardId)
+            ? card.backupCardId
+            : null,
+      });
+      seenAutomationIds.add(card.id);
+      return;
+    }
+
+    if (
+      !databaseIds.has(card.databaseId) ||
+      !backupSettingsByDatabaseId[card.databaseId]?.enabled ||
+      !backupSettingsByDatabaseId[card.databaseId]?.automation_enabled ||
+      attachedAutomationDatabaseIds.has(card.databaseId)
+    ) {
+      return;
+    }
+
+    normalizedAutomationCards.push({
+      ...card,
+      backupCardId:
+        attachedBackupCardIdByDatabaseId[card.databaseId] ||
+        card.backupCardId ||
+        null,
+    });
+    seenAutomationIds.add(card.id);
+    attachedAutomationDatabaseIds.add(card.databaseId);
+  });
+
+  return {
+    backupCards: normalizedBackupCards,
+    automationCards: normalizedAutomationCards,
+  };
+}
+
+function deriveEffectiveBackupCards(
+  storedBackupCards: BackupCardInfo[],
+  backupSettingsByDatabaseId: Record<number, BackupSettingsInfo>,
+  databases: DatabaseInfo[],
+): BackupCardInfo[] {
+  const databasesById = databases.reduce(
+    (acc, database) => {
+      acc[database.id] = database;
+      return acc;
+    },
+    {} as Record<number, DatabaseInfo>,
+  );
+  const attachedDatabaseIds = new Set<number>();
+  const effectiveBackupCards: BackupCardInfo[] = [];
+
+  storedBackupCards.forEach((card) => {
+    if (card.databaseId == null) {
+      effectiveBackupCards.push(card);
+      return;
+    }
+
+    const settings = backupSettingsByDatabaseId[card.databaseId];
+    const database = databasesById[card.databaseId];
+    if (
+      !settings?.enabled ||
+      !database ||
+      attachedDatabaseIds.has(card.databaseId)
+    ) {
+      return;
+    }
+
+    effectiveBackupCards.push({
+      ...card,
+      label: card.label || `${database.name} Backup`,
+      config: {
+        ...settings,
+        database_id: 0,
+      },
+    });
+    attachedDatabaseIds.add(card.databaseId);
+  });
+
+  databases.forEach((database) => {
+    const settings = backupSettingsByDatabaseId[database.id];
+    if (!settings?.enabled || attachedDatabaseIds.has(database.id)) {
+      return;
+    }
+
+    effectiveBackupCards.push({
+      id: `database-backup:${database.id}`,
+      label: `${database.name} Backup`,
+      config: {
+        ...settings,
+        database_id: 0,
+      },
+      databaseId: database.id,
+    });
+  });
+
+  return effectiveBackupCards;
+}
+
+function deriveEffectiveAutomationCards(
+  storedAutomationCards: AutomationCardInfo[],
+  effectiveBackupCards: BackupCardInfo[],
+  backupSettingsByDatabaseId: Record<number, BackupSettingsInfo>,
+  databases: DatabaseInfo[],
+): AutomationCardInfo[] {
+  const databasesById = databases.reduce(
+    (acc, database) => {
+      acc[database.id] = database;
+      return acc;
+    },
+    {} as Record<number, DatabaseInfo>,
+  );
+  const attachedBackupCardIdByDatabaseId = effectiveBackupCards.reduce(
+    (acc, card) => {
+      if (card.databaseId != null) {
+        acc[card.databaseId] = card.id;
+      }
+      return acc;
+    },
+    {} as Record<number, string>,
+  );
+  const attachedDatabaseIds = new Set<number>();
+  const effectiveAutomationCards: AutomationCardInfo[] = [];
+
+  storedAutomationCards.forEach((card) => {
+    if (card.databaseId == null) {
+      effectiveAutomationCards.push(card);
+      return;
+    }
+
+    const settings = backupSettingsByDatabaseId[card.databaseId];
+    const database = databasesById[card.databaseId];
+    if (
+      !settings?.enabled ||
+      !settings.automation_enabled ||
+      !database ||
+      attachedDatabaseIds.has(card.databaseId)
+    ) {
+      return;
+    }
+
+    effectiveAutomationCards.push({
+      ...card,
+      label: card.label || `${database.name} Backup Automation`,
+      automation_enabled: true,
+      automation_frequency: settings.automation_frequency || "daily",
+      backupCardId:
+        attachedBackupCardIdByDatabaseId[card.databaseId] ||
+        card.backupCardId ||
+        null,
+    });
+    attachedDatabaseIds.add(card.databaseId);
+  });
+
+  databases.forEach((database) => {
+    const settings = backupSettingsByDatabaseId[database.id];
+    if (
+      !settings?.enabled ||
+      !settings.automation_enabled ||
+      attachedDatabaseIds.has(database.id)
+    ) {
+      return;
+    }
+
+    effectiveAutomationCards.push({
+      id: `database-automation:${database.id}`,
+      label: `${database.name} Backup Automation`,
+      automation_enabled: true,
+      automation_frequency: settings.automation_frequency || "daily",
+      databaseId: database.id,
+      backupCardId: attachedBackupCardIdByDatabaseId[database.id] || null,
+    });
+  });
+
+  return effectiveAutomationCards;
+}
 
 function getNodeCardDimensions(node: GraphNode) {
   return {
     width:
       node.kind === "internet"
         ? INTERNET_CARD_WIDTH
-        : node.kind === "container"
-          ? CONTAINER_CARD_WIDTH
-          : DEFAULT_CARD_WIDTH,
+        : node.kind === "network"
+          ? NETWORK_CARD_WIDTH
+          : node.kind === "automation"
+            ? AUTOMATION_CARD_WIDTH
+            : node.kind === "backup"
+              ? BACKUP_CARD_WIDTH
+              : node.kind === "container"
+                ? CONTAINER_CARD_WIDTH
+                : DEFAULT_CARD_WIDTH,
     height:
       node.kind === "internet"
         ? INTERNET_CARD_HEIGHT
-        : node.kind === "service"
-          ? SERVICE_CARD_HEIGHT
-          : node.kind === "container"
-            ? CONTAINER_CARD_HEIGHT
-            : DEFAULT_CARD_HEIGHT,
+        : node.kind === "network"
+          ? NETWORK_CARD_HEIGHT
+          : node.kind === "automation"
+            ? AUTOMATION_CARD_HEIGHT
+            : node.kind === "backup"
+              ? BACKUP_CARD_HEIGHT
+              : node.kind === "service"
+                ? SERVICE_CARD_HEIGHT
+                : node.kind === "container"
+                  ? CONTAINER_CARD_HEIGHT
+                  : DEFAULT_CARD_HEIGHT,
   };
 }
 
@@ -286,6 +785,32 @@ function inferProjectName(
   return name.toLowerCase() === "baseful" ? "Baseful" : name;
 }
 
+function resolveContainerProjectName(
+  container: ContainerInfo,
+  projectsById: Record<string, ProjectInfo>,
+  databasesByName: Record<string, DatabaseInfo>,
+): string | null {
+  const databaseName = container.labels?.["baseful.database"]?.trim();
+  const isBranchContainer = Boolean(container.labels?.["baseful.branch"]);
+
+  if (databaseName && !isBranchContainer) {
+    const databaseRecord = databasesByName[databaseName.toLowerCase()];
+    if (databaseRecord) {
+      if (!databaseRecord.projectId) {
+        return null;
+      }
+
+      return (
+        projectsById[String(databaseRecord.projectId)]?.name ||
+        `Project ${databaseRecord.projectId}`
+      );
+    }
+  }
+
+  const inferred = inferProjectName(container.labels, projectsById);
+  return inferred.toLowerCase() === "unassigned" ? null : inferred;
+}
+
 function isBasefulContainer(
   container: ContainerInfo,
   projectsById: Record<string, ProjectInfo> = {},
@@ -327,13 +852,33 @@ function buildTopology(
   projectsById: Record<string, ProjectInfo>,
   allUsers: UserInfo[],
   proxyInfo: ProxyInfo | null,
+  databases: DatabaseInfo[],
+  backupCards: BackupCardInfo[],
+  automationCards: AutomationCardInfo[],
 ): { nodes: GraphNode[]; edges: GraphEdge[] } {
-  const projectSet = new Set<string>();
+  const projectSet = new Set<string>(
+    Object.values(projectsById)
+      .map((project) => project.name?.trim())
+      .filter((name): name is string => Boolean(name)),
+  );
   const networkSet = new Set<string>();
+  const databasesByName = databases.reduce(
+    (acc, database) => {
+      acc[database.name.toLowerCase()] = database;
+      return acc;
+    },
+    {} as Record<string, DatabaseInfo>,
+  );
 
   containers.forEach((container) => {
-    const project = inferProjectName(container.labels, projectsById);
-    projectSet.add(project);
+    const project = resolveContainerProjectName(
+      container,
+      projectsById,
+      databasesByName,
+    );
+    if (project) {
+      projectSet.add(project);
+    }
 
     if (container.ip) {
       networkSet.add(inferSubnet(container.ip));
@@ -344,15 +889,38 @@ function buildTopology(
   const networks = [...networkSet].sort();
 
   const containersPerNetwork: Record<string, number> = {};
+  const containerNamesByNetwork: Record<string, string[]> = {};
+  const projectsByNetwork: Record<string, Set<string>> = {};
   containers.forEach((c) => {
     if (c.ip) {
       const s = inferSubnet(c.ip);
       containersPerNetwork[s] = (containersPerNetwork[s] || 0) + 1;
+      containerNamesByNetwork[s] = [
+        ...(containerNamesByNetwork[s] || []),
+        getContainerDisplayNames(c).clean,
+      ];
+      if (!projectsByNetwork[s]) {
+        projectsByNetwork[s] = new Set<string>();
+      }
+      const project = resolveContainerProjectName(
+        c,
+        projectsById,
+        databasesByName,
+      );
+      if (project) {
+        projectsByNetwork[s].add(project);
+      }
     }
   });
 
   const nodes: GraphNode[] = [];
   const edges: GraphEdge[] = [];
+  const nodeCenterById = new Map<string, { x: number; y: number }>();
+
+  const registerNode = (node: GraphNode) => {
+    nodes.push(node);
+    nodeCenterById.set(node.id, { x: node.x, y: node.y });
+  };
 
   const xByKind: Record<GraphKind, number> = {
     internet: -140,
@@ -360,10 +928,13 @@ function buildTopology(
     service: 400,
     container: 560,
     network: 920,
+    automation: 1180,
+    backup: 1490,
   };
 
   let currentY = 80;
   const yGap = 220;
+  const databaseContainerNodeIds = new Map<number, string>();
 
   const projectY = new Map<string, number>();
   projects.forEach((project) => {
@@ -382,7 +953,7 @@ function buildTopology(
       finalUsers = allUsers;
     }
 
-    nodes.push({
+    registerNode({
       id: `project:${project}`,
       kind: "project",
       label: label,
@@ -426,7 +997,7 @@ function buildTopology(
         : xByKind.service;
     const internetY = proxyY;
 
-    nodes.push({
+    registerNode({
       id: "internet:public",
       kind: "internet",
       label: "Client Access",
@@ -436,7 +1007,7 @@ function buildTopology(
       y: internetY,
     });
 
-    nodes.push({
+    registerNode({
       id: "service:proxy",
       kind: "service",
       label: "Baseful Proxy",
@@ -460,15 +1031,21 @@ function buildTopology(
 
   // Group containers by project to make lines less intertwined
   const sortedContainers = containers.slice().sort((a, b) => {
-    const projA = inferProjectName(a.labels, projectsById);
-    const projB = inferProjectName(b.labels, projectsById);
+    const projA =
+      resolveContainerProjectName(a, projectsById, databasesByName) || "";
+    const projB =
+      resolveContainerProjectName(b, projectsById, databasesByName) || "";
     if (projA !== projB) return projA.localeCompare(projB);
     return getContainerName(a).localeCompare(getContainerName(b));
   });
 
   sortedContainers.forEach((container) => {
     const names = getContainerDisplayNames(container);
-    const project = inferProjectName(container.labels, projectsById);
+    const project = resolveContainerProjectName(
+      container,
+      projectsById,
+      databasesByName,
+    );
 
     const [imageNamePath, rawVersion = ""] = container.image.split(":");
     const imageName = imageNamePath.split("/").pop() || "";
@@ -477,13 +1054,18 @@ function buildTopology(
       Boolean(container.labels?.["baseful.database"]) ||
       Boolean(container.labels?.["baseful.branch"]) ||
       imageNameLower.startsWith("postgres");
+    const isBranchContainer = Boolean(container.labels?.["baseful.branch"]);
     // Hide version if it's a sha256 hash or is unusually long
     const isShaOrLong =
       rawVersion.startsWith("sha256") || rawVersion.length > 20;
     const versionStr =
       isShaOrLong || !rawVersion ? "" : `${imageName} ${rawVersion}`.trim();
+    const databaseName = container.labels?.["baseful.database"]?.trim();
+    const databaseRecord = databaseName
+      ? databasesByName[databaseName.toLowerCase()]
+      : undefined;
 
-    nodes.push({
+    registerNode({
       id: `container:${container.id}`,
       kind: "container",
       label: names.clean,
@@ -493,18 +1075,22 @@ function buildTopology(
       version: versionStr,
       color: container.state === "running" ? "#0f5132" : "#4b5563",
       containerId: container.id,
+      databaseId: !isBranchContainer ? databaseRecord?.id : undefined,
+      databaseName: !isBranchContainer ? databaseName : undefined,
       isSimulated: container.labels[BASEFUL_SIMULATED_LABEL] === "true",
       x: xByKind.container,
       y: currentY,
     });
 
     // Keep structural ownership link for all containers.
-    edges.push({
-      id: `edge:project:${project}:container:${container.id}`,
-      source: `project:${project}`,
-      target: `container:${container.id}`,
-      kind: "belongs",
-    });
+    if (project) {
+      edges.push({
+        id: `edge:project:${project}:container:${container.id}`,
+        source: `project:${project}`,
+        target: `container:${container.id}`,
+        kind: "belongs",
+      });
+    }
 
     // Overlay route link only for DB/branch postgres traffic through proxy.
     if (proxyInfo && isDatabaseContainer) {
@@ -525,43 +1111,161 @@ function buildTopology(
         kind: "exposes",
       });
     }
+    if (databaseRecord && !isBranchContainer) {
+      databaseContainerNodeIds.set(
+        databaseRecord.id,
+        `container:${container.id}`,
+      );
+    }
 
     currentY += yGap;
   });
 
-  currentY = 80;
+  const networkStartY = -520;
+  const networkYGap = 220;
+  currentY = networkStartY;
   networks.forEach((network) => {
-    nodes.push({
+    const projectCount = projectsByNetwork[network]?.size || 0;
+    const connectedContainers = (containerNamesByNetwork[network] || []).sort();
+
+    registerNode({
       id: `network:${network}`,
       kind: "network",
-      label: network,
-      detail: "subnet",
+      label: "Internal Network",
+      detail: "private traffic lane",
+      version: network,
       count: containersPerNetwork[network] || 0,
+      connectedContainers,
+      projectCount,
+      networkRole: projectCount > 1 ? "Shared bridge" : "Project bridge",
       color: "#4f3a1f",
       x: xByKind.network,
       y: currentY,
     });
-    currentY += yGap;
+    currentY += networkYGap;
+  });
+
+  const backupCountsByAnchor = new Map<string, number>();
+  const unattachedBackupBaseY = Math.max(
+    80,
+    nodes.reduce((maxY, node) => Math.max(maxY, node.y), 80) + yGap,
+  );
+
+  backupCards.forEach((card, index) => {
+    const databaseRecord =
+      card.databaseId != null
+        ? databases.find((database) => database.id === card.databaseId)
+        : undefined;
+    const providerLabel =
+      card.config.provider?.toLowerCase() === "s3"
+        ? card.config.endpoint?.toLowerCase().includes("r2")
+          ? "R2 Object Storage"
+          : "S3 Object Storage"
+        : card.config.provider || "Object Storage";
+    const endpointHost = card.config.endpoint
+      ? card.config.endpoint.replace(/^https?:\/\//, "").replace(/\/$/, "")
+      : "";
+
+    const databaseNodeId =
+      card.databaseId != null
+        ? databaseContainerNodeIds.get(card.databaseId)
+        : undefined;
+    const backupAnchorId = databaseNodeId ?? `unattached-backup:${index}`;
+    const backupAnchor = databaseNodeId
+      ? nodeCenterById.get(databaseNodeId)
+      : null;
+    const backupAnchorCount = backupCountsByAnchor.get(backupAnchorId) || 0;
+    backupCountsByAnchor.set(backupAnchorId, backupAnchorCount + 1);
+    const backupY = backupAnchor
+      ? backupAnchor.y + backupAnchorCount * 96
+      : unattachedBackupBaseY + index * yGap;
+
+    registerNode({
+      id: `backup-card:${card.id}`,
+      kind: "backup",
+      label: card.label,
+      detail: providerLabel,
+      version: card.config.bucket || "bucket",
+      color: "#0f3d4a",
+      databaseId: card.databaseId || undefined,
+      databaseName: databaseRecord?.name,
+      backupProvider: providerLabel,
+      backupBucket: card.config.bucket,
+      backupEndpoint: endpointHost || "Managed endpoint",
+      backupPathPrefix: card.config.path_prefix,
+      backupEncryptionEnabled: card.config.encryption_enabled,
+      x: xByKind.backup,
+      y: backupY,
+    });
+
+    if (databaseNodeId) {
+      edges.push({
+        id: `edge:${databaseNodeId}:backup-card:${card.id}`,
+        source: databaseNodeId,
+        target: `backup-card:${card.id}`,
+        kind: "backup",
+      });
+    }
+  });
+
+  const automationCountsByAnchor = new Map<string, number>();
+  const unattachedAutomationBaseY = unattachedBackupBaseY;
+
+  automationCards.forEach((card, index) => {
+    const databaseRecord =
+      card.databaseId != null
+        ? databases.find((database) => database.id === card.databaseId)
+        : undefined;
+    const databaseNodeId =
+      card.databaseId != null
+        ? databaseContainerNodeIds.get(card.databaseId)
+        : undefined;
+    const automationAnchorId =
+      card.backupCardId != null
+        ? `backup-card:${card.backupCardId}`
+        : databaseNodeId || `unattached-automation:${index}`;
+    const automationAnchor = nodeCenterById.get(automationAnchorId);
+    const automationAnchorCount =
+      automationCountsByAnchor.get(automationAnchorId) || 0;
+    automationCountsByAnchor.set(automationAnchorId, automationAnchorCount + 1);
+    const automationY = automationAnchor
+      ? automationAnchor.y - 100 + automationAnchorCount * 84
+      : unattachedAutomationBaseY + index * yGap;
+
+    registerNode({
+      id: `automation-card:${card.id}`,
+      kind: "automation",
+      label: card.label,
+      detail: "backup automation",
+      color: "#24414a",
+      databaseId: card.databaseId || undefined,
+      databaseName: databaseRecord?.name,
+      automationFrequency: card.automation_frequency || "daily",
+      x: xByKind.automation,
+      y: automationY,
+    });
+
+    if (card.backupCardId) {
+      edges.push({
+        id: `edge:automation-card:${card.id}:backup-card:${card.backupCardId}`,
+        source: `automation-card:${card.id}`,
+        target: `backup-card:${card.backupCardId}`,
+        kind: "backup",
+      });
+    } else if (card.databaseId != null) {
+      if (databaseNodeId) {
+        edges.push({
+          id: `edge:automation-card:${card.id}:${databaseNodeId}`,
+          source: `automation-card:${card.id}`,
+          target: databaseNodeId,
+          kind: "backup",
+        });
+      }
+    }
   });
 
   return { nodes, edges };
 }
-
-const ServiceIconSVG = ({ className }: { className?: string }) => (
-  <svg
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="2"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    className={className}
-  >
-    <rect x="2" y="4" width="20" height="4" rx="1" />
-    <rect x="2" y="10" width="20" height="4" rx="1" />
-    <rect x="2" y="16" width="20" height="4" rx="1" />
-  </svg>
-);
 
 const NetworkIconSVG = ({ className }: { className?: string }) => (
   <svg
@@ -581,26 +1285,6 @@ const NetworkIconSVG = ({ className }: { className?: string }) => (
   </svg>
 );
 
-const DockerLogoSVG = ({ className }: { className?: string }) => (
-  <svg
-    xmlns="http://www.w3.org/2000/svg"
-    viewBox="0 0 340 268"
-    className={className}
-  >
-    <defs>
-      <clipPath id="docker-clip">
-        <rect width="339.5" height="268" fill="none" />
-      </clipPath>
-    </defs>
-    <g clipPath="url(#docker-clip)">
-      <path
-        fill="currentColor"
-        d="M334,110.1c-8.3-5.6-30.2-8-46.1-3.7-.9-15.8-9-29.2-24-40.8l-5.5-3.7-3.7,5.6c-7.2,11-10.3,25.7-9.2,39,.8,8.2,3.7,17.4,9.2,24.1-20.7,12-39.8,9.3-124.3,9.3H0c-.4,19.1,2.7,55.8,26,85.6,2.6,3.3,5.4,6.5,8.5,9.6,19,19,47.6,32.9,90.5,33,65.4,0,121.4-35.3,155.5-120.8,11.2.2,40.8,2,55.3-26,.4-.5,3.7-7.4,3.7-7.4l-5.5-3.7h0ZM85.2,92.7h-36.7v36.7h36.7v-36.7ZM132.6,92.7h-36.7v36.7h36.7v-36.7ZM179.9,92.7h-36.7v36.7h36.7v-36.7ZM227.3,92.7h-36.7v36.7h36.7v-36.7ZM37.8,92.7H1.1v36.7h36.7v-36.7ZM85.2,46.3h-36.7v36.7h36.7v-36.7ZM132.6,46.3h-36.7v36.7h36.7v-36.7ZM179.9,46.3h-36.7v36.7h36.7v-36.7ZM179.9,0h-36.7v36.7h36.7V0Z"
-      />
-    </g>
-  </svg>
-);
-
 function TopologyNodeCard({ data }: NodeProps<TopologyFlowNode>) {
   const {
     node,
@@ -609,6 +1293,12 @@ function TopologyNodeCard({ data }: NodeProps<TopologyFlowNode>) {
     outboundRouteCount,
     hasIncoming,
     hasOutgoing,
+    hasIncomingRoute,
+    hasOutgoingRoute,
+    canAcceptIncomingConnection,
+    canStartOutgoingConnection,
+    canDelete,
+    canOpenBackupPage,
     containerMatch,
     actionLoading,
     isAdmin,
@@ -617,6 +1307,8 @@ function TopologyNodeCard({ data }: NodeProps<TopologyFlowNode>) {
     onOpenLogs,
     onContainerAction,
     onOpenProxyLogs,
+    onOpenBackupPage,
+    onRequestDelete,
   } = data;
   const isContainer = node.kind === "container";
   const { width: cardWidth, height: cardHeight } = getNodeCardDimensions(node);
@@ -635,7 +1327,7 @@ function TopologyNodeCard({ data }: NodeProps<TopologyFlowNode>) {
     );
     nodeTypeStr = "Project";
   } else if (node.kind === "service") {
-    iconNode = <ServiceIconSVG className="w-4 h-4 text-neutral-400" />;
+    iconNode = <ShieldStarIcon className="w-4 h-4 text-neutral-400" />;
     nodeTypeStr = "Service";
   } else if (node.kind === "internet") {
     iconNode = <GlobeIcon className="w-4 h-4 text-blue-300" />;
@@ -643,23 +1335,32 @@ function TopologyNodeCard({ data }: NodeProps<TopologyFlowNode>) {
   } else if (node.kind === "network") {
     iconNode = <NetworkIconSVG className="w-4 h-4 text-neutral-400" />;
     nodeTypeStr = "Network";
+  } else if (node.kind === "automation") {
+    iconNode = (
+      <ClockCounterClockwiseIcon className="w-4 h-4 text-neutral-200" />
+    );
+    nodeTypeStr = "Backup Automation";
+  } else if (node.kind === "backup") {
+    iconNode = <UploadIcon className="w-4 h-4 text-neutral-200" />;
+    nodeTypeStr = "Backup";
   } else if (isContainer) {
-    iconNode = node.isSimulated ? (
-      <CubeIcon className="w-4 h-4 text-amber-300" />
-    ) : (
-      <DockerLogoSVG className="w-4 h-4 text-neutral-300" />
+    iconNode = (
+      <DitherAvatar
+        value={node.databaseName || node.label || "database"}
+        size={16}
+      />
     );
     nodeTypeStr = "Container";
   }
 
   const actionsDisabled = node.isSimulated || Boolean(actionLoading);
-  const actionButtonClass = `h-7 flex-1 min-w-0 px-2 py-0 border rounded-md flex items-center justify-center text-[10px] uppercase tracking-wider font-semibold border-neutral-700 ${
+  const actionButtonClass = `h-7 transition-colors duration-200 flex-1 min-w-0 px-2 py-0 border rounded-md flex items-center justify-center text-[10px] uppercase tracking-wider font-semibold border-border ${
     actionsDisabled
       ? "opacity-40 pointer-events-none"
-      : "hover:bg-neutral-800 cursor-pointer"
+      : "hover:bg-[color-mix(in_srgb,var(--card)_90%,white)] bg-muted cursor-pointer"
   }`;
   const openButtonClass =
-    "h-7 flex-1 min-w-0 px-2 py-0 border rounded-md flex items-center justify-center text-[10px] uppercase tracking-wider font-semibold border-neutral-700 hover:bg-neutral-800 cursor-pointer";
+    "h-7 flex-1 min-w-0 px-2 py-0 bg-muted hover:bg-[color-mix(in_srgb,var(--card)_90%,white)] border rounded-md flex items-center justify-center text-[10px] uppercase tracking-wider font-semibold border-border cursor-pointer";
 
   return (
     <div
@@ -668,21 +1369,21 @@ function TopologyNodeCard({ data }: NodeProps<TopologyFlowNode>) {
           ? "bg-neutral-800 border-neutral-500 shadow-xl"
           : isRelated
             ? "bg-[#181818] border-neutral-600 shadow-md"
-            : "bg-[#121212] border-[#2a2a2a] shadow-md hover:border-[#3e3e3e]"
+            : "bg-[color-mix(in_srgb,var(--card)_97%,white)] border-[#2a2a2a] shadow-md hover:border-[#3e3e3e]"
       }`}
       style={{ width: cardWidth, height: cardHeight }}
       onClick={() => onSelect(node.id)}
     >
-      {hasIncoming && (
+      {(hasIncoming || canAcceptIncomingConnection) && (
         <Handle
           type="target"
           position={Position.Left}
           id="target-main"
-          isConnectable={false}
-          className="!h-2.5 !w-2.5 !rounded-full !border !border-neutral-700 !bg-[#111111] !left-[-5px] !cursor-default !pointer-events-none"
+          isConnectable={canAcceptIncomingConnection}
+          className={`!h-2.5 !w-2.5 !rounded-full !border !border-neutral-700 !bg-[#111111] !left-[-5px] ${canAcceptIncomingConnection ? "!cursor-crosshair" : "!cursor-default !pointer-events-none"}`}
         />
       )}
-      {node.kind === "container" && hasIncoming && (
+      {node.kind === "container" && hasIncomingRoute && (
         <Handle
           type="target"
           position={Position.Left}
@@ -692,16 +1393,17 @@ function TopologyNodeCard({ data }: NodeProps<TopologyFlowNode>) {
           className="!h-2.5 !w-2.5 !rounded-full !border !border-neutral-700 !bg-[#111111] !left-[-5px] !cursor-default !pointer-events-none"
         />
       )}
-      {hasOutgoing && (
+      {((hasOutgoing && node.kind !== "service") ||
+        canStartOutgoingConnection) && (
         <Handle
           type="source"
           position={Position.Right}
           id="source-main"
-          isConnectable={false}
-          className="!h-2.5 !w-2.5 !rounded-full !border !border-neutral-700 !bg-[#111111] !right-[-5px] !cursor-default !pointer-events-none"
+          isConnectable={canStartOutgoingConnection}
+          className={`!h-2.5 !w-2.5 !rounded-full !border !border-neutral-700 !bg-[#111111] !right-[-5px] ${canStartOutgoingConnection ? "!cursor-crosshair" : "!cursor-default !pointer-events-none"}`}
         />
       )}
-      {node.id === "service:proxy" && hasOutgoing && (
+      {node.id === "service:proxy" && hasOutgoingRoute && (
         <Handle
           type="source"
           position={Position.Right}
@@ -713,7 +1415,11 @@ function TopologyNodeCard({ data }: NodeProps<TopologyFlowNode>) {
       )}
       <div
         className={`flex items-center gap-2.5 px-3 ${
-          isContainer ? "h-[46px]" : "h-[34px]"
+          isContainer
+            ? "h-[46px]"
+            : node.kind === "backup"
+              ? "h-[58px]"
+              : "h-[34px]"
         } border-b ${isSelected ? "border-neutral-600" : "border-[#2a2a2a]"}`}
       >
         <div className="flex-shrink-0 flex items-center justify-center">
@@ -724,6 +1430,20 @@ function TopologyNodeCard({ data }: NodeProps<TopologyFlowNode>) {
             {node.label}
           </span>
           <div className="flex items-center gap-1.5 flex-shrink-0">
+            {canDelete && (
+              <button
+                type="button"
+                className="flex size-6 items-center justify-center rounded-sm border border-transparent text-neutral-500 transition-colors hover:border-white/10 hover:bg-white/5 hover:text-red-400"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onRequestDelete(node);
+                }}
+                aria-label={`Delete ${node.label}`}
+                title="Delete"
+              >
+                <TrashIcon size={14} />
+              </button>
+            )}
             {node.kind === "service" && (
               <span
                 className={`text-[10px] tracking-tight uppercase font-medium px-1.5 py-0.5 rounded border ${
@@ -802,15 +1522,105 @@ function TopologyNodeCard({ data }: NodeProps<TopologyFlowNode>) {
             </div>
           </div>
         ) : node.kind === "network" ? (
-          <div className="space-y-1">
-            <span className="text-[9px] text-neutral-500 font-bold uppercase tracking-widest block">
-              Network Status
-            </span>
-            <div className="flex items-center justify-between bg-blue-500/5 border border-blue-500/10 rounded px-2 py-1.5">
-              <span className="text-[10px] text-blue-400 font-bold tracking-tight">
-                {node.count} {node.count === 1 ? "Container" : "Containers"}{" "}
-                Active
-              </span>
+          <div className="space-y-2">
+            <div className="rounded border border-cyan-500/20 bg-cyan-500/[0.08] px-2 py-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[9px] text-cyan-200 font-bold uppercase tracking-wider">
+                  {node.networkRole || "Internal bridge"}
+                </span>
+                <span className="text-[10px] text-cyan-300 font-semibold">
+                  Private
+                </span>
+              </div>
+              <div className="mt-1 text-[10px] text-cyan-100/80 leading-tight">
+                Carries container-to-container traffic inside Docker.
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-1.5">
+              <div className="rounded border border-white/5 bg-neutral-900/40 px-2 py-1.5">
+                <div className="text-[8px] text-neutral-500 font-bold uppercase tracking-wider">
+                  Workloads
+                </div>
+                <div className="text-[10px] text-neutral-200 font-semibold">
+                  {node.count || 0}{" "}
+                  {node.count === 1 ? "Container" : "Containers"}
+                </div>
+              </div>
+              <div className="rounded border border-white/5 bg-neutral-900/40 px-2 py-1.5">
+                <div className="text-[8px] text-neutral-500 font-bold uppercase tracking-wider">
+                  Scope
+                </div>
+                <div className="text-[10px] text-neutral-200 font-semibold">
+                  {node.projectCount || 0}{" "}
+                  {node.projectCount === 1 ? "Project" : "Projects"}
+                </div>
+              </div>
+            </div>
+            <div className="text-[9px] text-neutral-400 leading-tight">
+              {node.connectedContainers?.length
+                ? `Attached: ${node.connectedContainers.slice(0, 2).join(", ")}${node.connectedContainers.length > 2 ? ` +${node.connectedContainers.length - 2}` : ""}`
+                : "No attached workloads"}
+            </div>
+          </div>
+        ) : node.kind === "backup" ? (
+          <div className="space-y-2">
+            <div className="rounded border border-sky-500/20 bg-sky-500/[0.08] px-2 py-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[9px] text-sky-100 font-bold uppercase tracking-wider">
+                  External snapshot target
+                </span>
+                <span className="text-[10px] text-sky-300 font-semibold">
+                  Enabled
+                </span>
+              </div>
+              <div className="mt-1 text-[10px] text-sky-100/80 leading-tight">
+                Stores backups for {node.databaseName || "this database"}{" "}
+                outside the local Docker network.
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-1.5">
+              <div className="rounded border border-white/5 bg-neutral-900/40 px-2 py-1.5">
+                <div className="text-[8px] text-neutral-500 font-bold uppercase tracking-wider">
+                  Provider
+                </div>
+                <div className="text-[10px] text-neutral-200 font-semibold truncate">
+                  {node.backupProvider || "Object storage"}
+                </div>
+              </div>
+              <div className="rounded border border-white/5 bg-neutral-900/40 px-2 py-1.5">
+                <div className="text-[8px] text-neutral-500 font-bold uppercase tracking-wider">
+                  Encryption
+                </div>
+                <div className="text-[10px] text-neutral-200 font-semibold">
+                  {node.backupEncryptionEnabled ? "On" : "Off"}
+                </div>
+              </div>
+            </div>
+            <div className="text-[9px] text-neutral-400 leading-tight">
+              Bucket: {node.backupBucket || "Not configured"}
+            </div>
+          </div>
+        ) : node.kind === "automation" ? (
+          <div className="space-y-2">
+            <div className="rounded border border-cyan-500/20 bg-cyan-500/[0.08] px-2 py-1.5">
+              <div className="text-[9px] text-cyan-100 font-bold uppercase tracking-wider">
+                Scheduled backup runner
+              </div>
+              <div className="mt-1 text-[10px] text-cyan-100/80 leading-tight">
+                Prepares recurring snapshot jobs for this database.
+              </div>
+            </div>
+            <div className="rounded border border-white/5 bg-neutral-900/40 px-2 py-1.5">
+              <div className="text-[8px] text-neutral-500 font-bold uppercase tracking-wider">
+                Frequency
+              </div>
+              <div className="text-[10px] text-neutral-200 font-semibold">
+                {node.automationFrequency === "hourly"
+                  ? "Every hour"
+                  : node.automationFrequency === "weekly"
+                    ? "Every week"
+                    : "Every day"}
+              </div>
             </div>
           </div>
         ) : node.kind === "service" ? (
@@ -891,10 +1701,14 @@ function TopologyNodeCard({ data }: NodeProps<TopologyFlowNode>) {
           )
         )}
       </div>
-      {(isContainer || node.kind === "project") && (
+      {(isContainer || node.kind === "project" || node.kind === "backup") && (
         <div
           className={`flex items-center px-3 border-t gap-1 ${
-            isContainer ? "h-[48px]" : "h-[40px]"
+            isContainer
+              ? "h-[48px]"
+              : node.kind === "backup"
+                ? "h-[52px]"
+                : "h-[40px]"
           } ${isSelected ? "border-neutral-600" : "border-[#2a2a2a]"}`}
         >
           {isContainer && containerMatch && !node.isSimulated && (
@@ -930,6 +1744,7 @@ function TopologyNodeCard({ data }: NodeProps<TopologyFlowNode>) {
                   onContainerAction(
                     containerMatch,
                     containerMatch.state === "running" ? "stop" : "start",
+                    node.databaseId,
                   );
                 }}
                 onKeyDown={(e) => {
@@ -941,6 +1756,7 @@ function TopologyNodeCard({ data }: NodeProps<TopologyFlowNode>) {
                     onContainerAction(
                       containerMatch,
                       containerMatch.state === "running" ? "stop" : "start",
+                      node.databaseId,
                     );
                   }
                 }}
@@ -955,7 +1771,7 @@ function TopologyNodeCard({ data }: NodeProps<TopologyFlowNode>) {
                 onClick={(e) => {
                   if (actionsDisabled) return;
                   e.stopPropagation();
-                  onContainerAction(containerMatch, "restart");
+                  onContainerAction(containerMatch, "restart", node.databaseId);
                 }}
                 onKeyDown={(e) => {
                   if (
@@ -963,7 +1779,11 @@ function TopologyNodeCard({ data }: NodeProps<TopologyFlowNode>) {
                     !actionsDisabled
                   ) {
                     e.preventDefault();
-                    onContainerAction(containerMatch, "restart");
+                    onContainerAction(
+                      containerMatch,
+                      "restart",
+                      node.databaseId,
+                    );
                   }
                 }}
                 className={actionButtonClass}
@@ -978,18 +1798,36 @@ function TopologyNodeCard({ data }: NodeProps<TopologyFlowNode>) {
             tabIndex={0}
             onClick={(e) => {
               e.stopPropagation();
+              if (
+                node.kind === "backup" &&
+                node.databaseId &&
+                canOpenBackupPage
+              ) {
+                onOpenBackupPage(node.databaseId);
+                return;
+              }
               onSelect(node.id);
               onOpen(node, containerMatch);
             }}
             onKeyDown={(e) => {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
+                if (
+                  node.kind === "backup" &&
+                  node.databaseId &&
+                  canOpenBackupPage
+                ) {
+                  onOpenBackupPage(node.databaseId);
+                  return;
+                }
                 onSelect(node.id);
               }
             }}
             className={openButtonClass}
           >
-            Open
+            {node.kind === "backup" && node.databaseId && canOpenBackupPage
+              ? "Open Backup Page"
+              : "Open"}
           </div>
         </div>
       )}
@@ -998,7 +1836,21 @@ function TopologyNodeCard({ data }: NodeProps<TopologyFlowNode>) {
 }
 
 export default function Containers() {
-  const { token, logout, user } = useAuth();
+  const navigate = useNavigate();
+  const { token, logout, user, hasPermission } = useAuth();
+  const { refreshDatabases } = useDatabase();
+  const { refreshProjects } = useProject();
+  const canAccessServer = user?.isAdmin || hasPermission("server_access");
+  const canManageBackups = user?.isAdmin || hasPermission("manage_backups");
+  const canDeleteDatabases =
+    user?.isAdmin ||
+    hasPermission("delete_databases") ||
+    hasPermission("create_databases");
+  const canExecContainers = user?.isAdmin || hasPermission("container_exec");
+  const [createProjectOpen, setCreateProjectOpen] = useState(false);
+  const [createDatabaseOpen, setCreateDatabaseOpen] = useState(false);
+  const [createBackupOpen, setCreateBackupOpen] = useState(false);
+  const [createAutomationOpen, setCreateAutomationOpen] = useState(false);
   const [containers, setContainers] = useState<ContainerInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -1006,6 +1858,15 @@ export default function Containers() {
     {},
   );
   const [allUsers, setAllUsers] = useState<UserInfo[]>([]);
+  const [databases, setDatabases] = useState<DatabaseInfo[]>([]);
+  const [backupSettingsByDatabaseId, setBackupSettingsByDatabaseId] = useState<
+    Record<number, BackupSettingsInfo>
+  >({});
+  const [backupCards, setBackupCards] = useState<BackupCardInfo[]>([]);
+  const [automationCards, setAutomationCards] = useState<AutomationCardInfo[]>(
+    [],
+  );
+  const [serviceCardsHydrated, setServiceCardsHydrated] = useState(false);
   const [proxyInfo, setProxyInfo] = useState<ProxyInfo | null>(null);
   const [selectedContainer, setSelectedContainer] =
     useState<ContainerInfo | null>(null);
@@ -1017,10 +1878,26 @@ export default function Containers() {
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [command, setCommand] = useState("");
   const [executing, setExecuting] = useState(false);
-  const [flowViewport, setFlowViewport] = useState<Viewport>({
-    x: 0,
-    y: 0,
-    zoom: 1,
+  const [flowViewport, setFlowViewport] = useState<Viewport>(DEFAULT_VIEWPORT);
+  const [viewportHydrated, setViewportHydrated] = useState(false);
+  const [hasStoredViewport, setHasStoredViewport] = useState(false);
+  const [customNodePositions, setCustomNodePositions] = useState<
+    Record<string, NodeCenterPosition>
+  >(() => loadStoredNodePositions());
+  const [pendingCreationPosition, setPendingCreationPosition] =
+    useState<NodeCenterPosition | null>(null);
+  const [backupSubmitting, setBackupSubmitting] = useState(false);
+  const [automationSubmitting, setAutomationSubmitting] = useState(false);
+  const [backupCopySourceId, setBackupCopySourceId] = useState<string>("");
+  const [backupForm, setBackupForm] = useState<BackupSettingsInfo>(
+    createDefaultBackupSettings(0),
+  );
+  const [automationForm, setAutomationForm] = useState<{
+    automationEnabled: boolean;
+    automationFrequency: string;
+  }>({
+    automationEnabled: true,
+    automationFrequency: "daily",
   });
   const [reactFlowInstance, setReactFlowInstance] = useState<ReactFlowInstance<
     TopologyFlowNode,
@@ -1044,13 +1921,34 @@ export default function Containers() {
   const [pendingContainerAction, setPendingContainerAction] = useState<{
     container: ContainerInfo;
     action: "start" | "stop" | "restart";
+    databaseId?: number;
   } | null>(null);
+  const [pendingBackupAssignment, setPendingBackupAssignment] = useState<{
+    backupCardId: string;
+    databaseId: number;
+    databaseName: string;
+  } | null>(null);
+  const [backupAssignmentLoading, setBackupAssignmentLoading] = useState(false);
+  const [pendingNodeDeletion, setPendingNodeDeletion] = useState<{
+    node: GraphNode;
+    title: string;
+    description: string;
+    confirmText: string;
+  } | null>(null);
+  const [nodeDeletionLoading, setNodeDeletionLoading] = useState(false);
   const [isMobileDrawer, setIsMobileDrawer] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const logsScrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const mapFrameRef = useRef<HTMLDivElement>(null);
   const mapInitializedRef = useRef(false);
+  const lastServiceCardsSnapshotRef = useRef(
+    serializeServiceCardsPayload({
+      backupCards: [],
+      automationCards: [],
+    }),
+  );
 
   const terminalOutput = useMemo(
     () =>
@@ -1094,6 +1992,10 @@ export default function Containers() {
       hiddenLineCount > 0 ? lines.slice(-MAX_RENDERED_LOG_LINES) : lines;
     return { hiddenLineCount, lines: visibleLines };
   }, [renderedLogsContent.text]);
+  const viewportStorageKey = useMemo(
+    () => buildScopedStorageKey(VIEWPORT_STORAGE_KEY, user?.id),
+    [user?.id],
+  );
 
   const scrollTerminalToBottom = useCallback(() => {
     if (!scrollRef.current) return;
@@ -1120,6 +2022,221 @@ export default function Containers() {
     return () => window.removeEventListener("resize", updateMobileDrawer);
   }, []);
 
+  const persistServiceCards = useCallback(
+    async (payload: ServiceCardsPayload) => {
+      if (!canAccessServer || !canManageBackups) {
+        return;
+      }
+
+      const nextSnapshot = serializeServiceCardsPayload(payload);
+      if (nextSnapshot === lastServiceCardsSnapshotRef.current) {
+        return;
+      }
+
+      const response = await authFetch(
+        "/api/topology/service-cards",
+        token,
+        {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+        },
+        logout,
+      );
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(data?.error || "Failed to save service cards");
+      }
+
+      lastServiceCardsSnapshotRef.current = nextSnapshot;
+    },
+    [canAccessServer, canManageBackups, logout, token],
+  );
+
+  useEffect(() => {
+    if (!serviceCardsHydrated || !canAccessServer || !canManageBackups) {
+      return;
+    }
+
+    const payload = {
+      backupCards,
+      automationCards,
+    };
+    const nextSnapshot = serializeServiceCardsPayload(payload);
+    if (nextSnapshot === lastServiceCardsSnapshotRef.current) {
+      return;
+    }
+
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        await persistServiceCards(payload);
+        if (!cancelled) {
+          lastServiceCardsSnapshotRef.current = nextSnapshot;
+        }
+      } catch (error) {
+        if (!cancelled) {
+          toast.error(
+            error instanceof Error
+              ? error.message
+              : "Failed to save service cards",
+          );
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    automationCards,
+    backupCards,
+    canAccessServer,
+    canManageBackups,
+    logout,
+    persistServiceCards,
+    serviceCardsHydrated,
+    token,
+  ]);
+
+  useLayoutEffect(() => {
+    setViewportHydrated(false);
+    const storedViewport = loadStoredViewport(viewportStorageKey);
+    setFlowViewport(storedViewport ?? DEFAULT_VIEWPORT);
+    setHasStoredViewport(Boolean(storedViewport));
+    setViewportHydrated(true);
+
+    if (reactFlowInstance && storedViewport) {
+      void reactFlowInstance.setViewport(storedViewport, { duration: 0 });
+    }
+  }, [reactFlowInstance, viewportStorageKey]);
+
+  useEffect(() => {
+    if (!viewportHydrated) {
+      return;
+    }
+
+    persistViewport(viewportStorageKey, flowViewport);
+  }, [flowViewport, viewportHydrated, viewportStorageKey]);
+
+  const setNodePlacement = useCallback(
+    (nodeId: string, position: NodeCenterPosition | null) => {
+      setCustomNodePositions((prev) => {
+        const next = { ...prev };
+
+        if (position) {
+          next[nodeId] = position;
+        } else {
+          delete next[nodeId];
+        }
+
+        persistNodePositions(next);
+        return next;
+      });
+    },
+    [],
+  );
+
+  const clearNodePlacements = useCallback((nodeIds: string[]) => {
+    if (nodeIds.length === 0) {
+      return;
+    }
+
+    setCustomNodePositions((prev) => {
+      const next = { ...prev };
+      nodeIds.forEach((nodeId) => {
+        delete next[nodeId];
+      });
+      persistNodePositions(next);
+      return next;
+    });
+  }, []);
+
+  const saveBackupSettingsForDatabase = useCallback(
+    async (databaseId: number, settings: BackupSettingsInfo) => {
+      const response = await authFetch(
+        `/api/databases/${databaseId}/backups/settings`,
+        token,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...settings,
+            database_id: databaseId,
+          }),
+        },
+        logout,
+      );
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || "Failed to save backup settings");
+      }
+    },
+    [logout, token],
+  );
+
+  const resolveFlowPositionFromClient = useCallback(
+    (clientX?: number, clientY?: number): NodeCenterPosition => {
+      if (reactFlowInstance && clientX !== undefined && clientY !== undefined) {
+        return reactFlowInstance.screenToFlowPosition({
+          x: clientX,
+          y: clientY,
+        });
+      }
+
+      const rect = mapFrameRef.current?.getBoundingClientRect();
+      if (reactFlowInstance && rect) {
+        return reactFlowInstance.screenToFlowPosition({
+          x: rect.left + rect.width / 2,
+          y: rect.top + rect.height / 2,
+        });
+      }
+
+      return {
+        x: (420 - flowViewport.x) / Math.max(flowViewport.zoom, 0.001),
+        y: (280 - flowViewport.y) / Math.max(flowViewport.zoom, 0.001),
+      };
+    },
+    [flowViewport.x, flowViewport.y, flowViewport.zoom, reactFlowInstance],
+  );
+
+  const openCreateDialog = useCallback(
+    (
+      kind: CreateEntityKind,
+      position = pendingCreationPosition ?? resolveFlowPositionFromClient(),
+    ) => {
+      setPendingCreationPosition(position);
+
+      if (kind === "project") {
+        setCreateProjectOpen(true);
+        return;
+      }
+
+      if (kind === "database") {
+        setCreateDatabaseOpen(true);
+        return;
+      }
+
+      if (kind === "backup") {
+        setBackupCopySourceId("");
+        setBackupForm(createDefaultBackupSettings(0));
+        setCreateBackupOpen(true);
+        return;
+      }
+
+      setAutomationForm({
+        automationEnabled: true,
+        automationFrequency: "daily",
+      });
+      setCreateAutomationOpen(true);
+    },
+    [pendingCreationPosition, resolveFlowPositionFromClient],
+  );
+
   const fetchContainers = useCallback(async () => {
     try {
       setLoading(true);
@@ -1128,6 +2245,8 @@ export default function Containers() {
         projectsResponse,
         usersResponse,
         proxyResponse,
+        databasesResponse,
+        serviceCardsResponse,
       ] = await Promise.all([
         authFetch("/api/docker/containers", token, {}, logout),
         authFetch("/api/projects", token, {}, logout),
@@ -1135,10 +2254,19 @@ export default function Containers() {
           ? authFetch("/api/auth/users", token, {}, logout)
           : Promise.resolve(null),
         authFetch("/api/docker/proxy", token, {}, logout),
+        authFetch("/api/databases", token, {}, logout),
+        canAccessServer && canManageBackups
+          ? authFetch("/api/topology/service-cards", token, {}, logout)
+          : Promise.resolve(null),
       ]);
 
       if (!containersResponse.ok) throw new Error("Failed to fetch containers");
-      const rawContainerData: ContainerInfo[] = await containersResponse.json();
+      const rawContainersPayload = await containersResponse.json();
+      const rawContainerData: ContainerInfo[] = Array.isArray(
+        rawContainersPayload,
+      )
+        ? rawContainersPayload
+        : [];
       let projectMap: Record<string, ProjectInfo> = {};
 
       const isLocal =
@@ -1156,6 +2284,85 @@ export default function Containers() {
           {} as Record<string, ProjectInfo>,
         );
         setProjectsById(projectMap);
+      }
+
+      let databasesData: DatabaseInfo[] = [];
+      let nextBackupSettingsByDatabaseId: Record<number, BackupSettingsInfo> =
+        {};
+
+      if (databasesResponse.ok) {
+        databasesData = await databasesResponse.json();
+        setDatabases(databasesData || []);
+
+        if (canManageBackups) {
+          const backupSettingsEntries = await Promise.all(
+            (databasesData || []).map(async (database) => {
+              const response = await authFetch(
+                `/api/databases/${database.id}/backups/settings`,
+                token,
+                {},
+                logout,
+              );
+
+              if (!response.ok) {
+                return null;
+              }
+
+              const settings: BackupSettingsInfo = await response.json();
+              return [database.id, settings] as const;
+            }),
+          );
+
+          nextBackupSettingsByDatabaseId = backupSettingsEntries.reduce(
+            (acc, entry) => {
+              if (entry) {
+                acc[entry[0]] = entry[1];
+              }
+              return acc;
+            },
+            {} as Record<number, BackupSettingsInfo>,
+          );
+          setBackupSettingsByDatabaseId(nextBackupSettingsByDatabaseId);
+        } else {
+          setBackupSettingsByDatabaseId({});
+        }
+      } else {
+        setDatabases([]);
+        setBackupSettingsByDatabaseId({});
+      }
+
+      if (serviceCardsResponse?.ok) {
+        const rawServiceCards =
+          (await serviceCardsResponse.json()) as Partial<ServiceCardsPayload>;
+        const normalizedRawServiceCards =
+          normalizeServiceCardsPayload(rawServiceCards);
+        const nextServiceCards = normalizeStoredServiceCards(
+          normalizedRawServiceCards,
+          nextBackupSettingsByDatabaseId,
+          databasesData,
+        );
+        const rawSnapshot = serializeServiceCardsPayload(
+          normalizedRawServiceCards,
+        );
+
+        if (rawSnapshot !== lastServiceCardsSnapshotRef.current) {
+          setBackupCards(nextServiceCards.backupCards);
+          setAutomationCards(nextServiceCards.automationCards);
+          lastServiceCardsSnapshotRef.current = rawSnapshot;
+        }
+        setServiceCardsHydrated(true);
+      } else if (!canAccessServer || !canManageBackups) {
+        const emptyServiceCards = {
+          backupCards: [],
+          automationCards: [],
+        };
+        setBackupCards(emptyServiceCards.backupCards);
+        setAutomationCards(emptyServiceCards.automationCards);
+        lastServiceCardsSnapshotRef.current =
+          serializeServiceCardsPayload(emptyServiceCards);
+        setServiceCardsHydrated(true);
+      } else {
+        throw new Error("Failed to fetch service cards");
       }
 
       const hasBasefulContainer = rawContainerData.some((container) =>
@@ -1210,7 +2417,7 @@ export default function Containers() {
     } finally {
       setLoading(false);
     }
-  }, [token, logout, user?.isAdmin]);
+  }, [canAccessServer, canManageBackups, token, logout, user?.isAdmin]);
 
   useEffect(() => {
     fetchContainers();
@@ -1218,8 +2425,630 @@ export default function Containers() {
     return () => clearInterval(interval);
   }, [fetchContainers]);
 
+  const refreshTopologyAndShared = useCallback(async () => {
+    await Promise.all([
+      fetchContainers(),
+      refreshDatabases(),
+      refreshProjects(),
+    ]);
+  }, [fetchContainers, refreshDatabases, refreshProjects]);
+
+  const handleProjectCreated = useCallback(
+    async (project?: { id: number; name: string }) => {
+      if (project?.name && pendingCreationPosition) {
+        setNodePlacement(`project:${project.name}`, pendingCreationPosition);
+      }
+      setPendingCreationPosition(null);
+      await refreshTopologyAndShared();
+    },
+    [pendingCreationPosition, refreshTopologyAndShared, setNodePlacement],
+  );
+
+  const handleDatabaseCreated = useCallback(
+    async (database?: { containerId?: string }) => {
+      if (database?.containerId && pendingCreationPosition) {
+        setNodePlacement(
+          `container:${database.containerId}`,
+          pendingCreationPosition,
+        );
+      }
+      setPendingCreationPosition(null);
+      await refreshTopologyAndShared();
+    },
+    [pendingCreationPosition, refreshTopologyAndShared, setNodePlacement],
+  );
+
+  const applyBackupCardToDatabase = useCallback(
+    async (backupCard: BackupCardInfo, databaseId: number) => {
+      const response = await authFetch(
+        `/api/topology/backup-cards/${backupCard.id}/apply`,
+        token,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ databaseId }),
+        },
+        logout,
+      );
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || "Failed to apply backup settings");
+      }
+    },
+    [logout, token],
+  );
+
+  const applyAutomationCardToDatabase = useCallback(
+    async (automationCard: AutomationCardInfo, databaseId: number) => {
+      const existingSettings =
+        backupSettingsByDatabaseId[databaseId] ||
+        createDefaultBackupSettings(databaseId);
+
+      if (!existingSettings.enabled) {
+        throw new Error("Create or attach a backup card first");
+      }
+
+      await saveBackupSettingsForDatabase(databaseId, {
+        ...existingSettings,
+        database_id: databaseId,
+        enabled: true,
+        automation_enabled: automationCard.automation_enabled,
+        automation_frequency: automationCard.automation_frequency,
+      });
+    },
+    [backupSettingsByDatabaseId, saveBackupSettingsForDatabase],
+  );
+
+  const handleBackupSubmit = useCallback(
+    async (event: React.FormEvent) => {
+      event.preventDefault();
+
+      setBackupSubmitting(true);
+      try {
+        const newCardId = createId("backup-card");
+        const nextLabel = `Backup Target ${backupCards.length + 1}`;
+        const response = await authFetch(
+          "/api/topology/backup-cards",
+          token,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              id: newCardId,
+              label: nextLabel,
+              config: {
+                ...backupForm,
+                database_id: 0,
+                enabled: true,
+              },
+              sourceDatabaseId: backupCopySourceId
+                ? Number.parseInt(backupCopySourceId, 10)
+                : 0,
+            }),
+          },
+          logout,
+        );
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data?.error || "Failed to create backup target");
+        }
+
+        setBackupCards((prev) => [...prev, data as BackupCardInfo]);
+
+        if (pendingCreationPosition) {
+          setNodePlacement(`backup-card:${newCardId}`, pendingCreationPosition);
+        }
+
+        setCreateBackupOpen(false);
+        setPendingCreationPosition(null);
+        setBackupCopySourceId("");
+        setBackupForm(createDefaultBackupSettings(0));
+        toast.success("Backup target created");
+      } catch (err) {
+        toast.error(
+          err instanceof Error ? err.message : "Failed to create backup target",
+        );
+      } finally {
+        setBackupSubmitting(false);
+      }
+    },
+    [
+      backupCards.length,
+      backupCopySourceId,
+      backupForm,
+      logout,
+      pendingCreationPosition,
+      setNodePlacement,
+      token,
+    ],
+  );
+
+  const handleAutomationSubmit = useCallback(
+    async (event: React.FormEvent) => {
+      event.preventDefault();
+
+      setAutomationSubmitting(true);
+      try {
+        const newCardId = createId("automation-card");
+        setAutomationCards((prev) => [
+          ...prev,
+          {
+            id: newCardId,
+            label: `Backup Automation ${prev.length + 1}`,
+            automation_enabled: automationForm.automationEnabled,
+            automation_frequency: automationForm.automationFrequency,
+            databaseId: null,
+            backupCardId: null,
+          },
+        ]);
+
+        if (pendingCreationPosition) {
+          setNodePlacement(
+            `automation-card:${newCardId}`,
+            pendingCreationPosition,
+          );
+        }
+
+        setCreateAutomationOpen(false);
+        setPendingCreationPosition(null);
+        toast.success("Backup automation created");
+      } catch (err) {
+        toast.error(
+          err instanceof Error
+            ? err.message
+            : "Failed to create backup automation",
+        );
+      } finally {
+        setAutomationSubmitting(false);
+      }
+    },
+    [automationForm, pendingCreationPosition, setNodePlacement],
+  );
+
+  const removeServiceCardsForDatabases = useCallback(
+    (databaseIds: number[]) => {
+      if (databaseIds.length === 0) {
+        return [];
+      }
+
+      const databaseIdSet = new Set(databaseIds);
+      const removedBackupIds = backupCards
+        .filter(
+          (card) =>
+            card.databaseId != null && databaseIdSet.has(card.databaseId),
+        )
+        .map((card) => card.id);
+      const removedBackupIdSet = new Set(removedBackupIds);
+      const removedNodeIds = [
+        ...removedBackupIds.map((id) => `backup-card:${id}`),
+        ...automationCards
+          .filter(
+            (card) =>
+              (card.databaseId != null && databaseIdSet.has(card.databaseId)) ||
+              (card.backupCardId != null &&
+                removedBackupIdSet.has(card.backupCardId)),
+          )
+          .map((card) => `automation-card:${card.id}`),
+      ];
+
+      setBackupCards((prev) =>
+        prev.filter(
+          (card) =>
+            !(card.databaseId != null && databaseIdSet.has(card.databaseId)),
+        ),
+      );
+      setAutomationCards((prev) =>
+        prev.filter(
+          (card) =>
+            !(
+              (card.databaseId != null && databaseIdSet.has(card.databaseId)) ||
+              (card.backupCardId != null &&
+                removedBackupIdSet.has(card.backupCardId))
+            ),
+        ),
+      );
+
+      return removedNodeIds;
+    },
+    [automationCards, backupCards],
+  );
+
+  const visibleDatabaseIds = useMemo(
+    () => new Set(databases.map((database) => database.id)),
+    [databases],
+  );
+  const persistedBackupCardIds = useMemo(
+    () => new Set(backupCards.map((card) => card.id)),
+    [backupCards],
+  );
+  const persistedAutomationCardIds = useMemo(
+    () => new Set(automationCards.map((card) => card.id)),
+    [automationCards],
+  );
+  const effectiveBackupCards = useMemo(
+    () =>
+      deriveEffectiveBackupCards(
+        backupCards,
+        backupSettingsByDatabaseId,
+        databases,
+      ),
+    [backupCards, backupSettingsByDatabaseId, databases],
+  );
+  const effectiveAutomationCards = useMemo(
+    () =>
+      deriveEffectiveAutomationCards(
+        automationCards,
+        effectiveBackupCards,
+        backupSettingsByDatabaseId,
+        databases,
+      ),
+    [
+      automationCards,
+      effectiveBackupCards,
+      backupSettingsByDatabaseId,
+      databases,
+    ],
+  );
+
+  const requestNodeDeletion = useCallback(
+    (node: GraphNode) => {
+      if (node.kind === "project" && node.label.toLowerCase() !== "baseful") {
+        const project = Object.values(projectsById).find(
+          (entry) => entry.name.toLowerCase() === node.label.toLowerCase(),
+        );
+        const connectedDatabaseCount = project
+          ? databases.filter((database) => database.projectId === project.id)
+              .length
+          : 0;
+        setPendingNodeDeletion({
+          node,
+          title: `Delete ${node.label}?`,
+          description:
+            connectedDatabaseCount > 0
+              ? `This will permanently delete the project and ${connectedDatabaseCount} connected database${connectedDatabaseCount === 1 ? "" : "s"}.`
+              : "This will permanently delete the project.",
+          confirmText: "Delete Project",
+        });
+        return;
+      }
+
+      if (node.kind === "container" && node.databaseId) {
+        setPendingNodeDeletion({
+          node,
+          title: `Delete ${node.label}?`,
+          description:
+            "This will permanently delete the database container and remove it from the map.",
+          confirmText: "Delete Database",
+        });
+        return;
+      }
+
+      if (node.kind === "backup") {
+        setPendingNodeDeletion({
+          node,
+          title: `Delete ${node.label}?`,
+          description:
+            node.databaseId != null
+              ? "This will remove the backup target card and clear the connected database backup configuration."
+              : "This will remove the backup target card from the map.",
+          confirmText: "Delete Backup Target",
+        });
+        return;
+      }
+
+      if (node.kind === "automation") {
+        setPendingNodeDeletion({
+          node,
+          title: `Delete ${node.label}?`,
+          description:
+            node.databaseId != null
+              ? "This will remove the backup automation card and disable automation for the connected backup target."
+              : "This will remove the backup automation card from the map.",
+          confirmText: "Delete Automation",
+        });
+      }
+    },
+    [databases, projectsById],
+  );
+
+  const confirmNodeDeletion = useCallback(async () => {
+    if (!pendingNodeDeletion) {
+      return;
+    }
+
+    const node = pendingNodeDeletion.node;
+    setNodeDeletionLoading(true);
+    try {
+      if (node.kind === "project") {
+        const project = Object.values(projectsById).find(
+          (entry) => entry.name.toLowerCase() === node.label.toLowerCase(),
+        );
+        if (!project) {
+          throw new Error("Project could not be resolved");
+        }
+
+        const projectDatabaseIds = databases
+          .filter((database) => database.projectId === project.id)
+          .map((database) => database.id);
+        const response = await authFetch(
+          `/api/projects/${project.id}`,
+          token,
+          { method: "DELETE" },
+          logout,
+        );
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data?.error || "Failed to delete project");
+        }
+
+        const removedNodeIds =
+          removeServiceCardsForDatabases(projectDatabaseIds);
+        clearNodePlacements([node.id, ...removedNodeIds]);
+        await refreshTopologyAndShared();
+        toast.success("Project deleted");
+      } else if (node.kind === "container" && node.databaseId) {
+        const response = await authFetch(
+          `/api/databases/${node.databaseId}/delete`,
+          token,
+          { method: "POST" },
+          logout,
+        );
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data?.error || "Failed to delete database");
+        }
+
+        const removedNodeIds = removeServiceCardsForDatabases([
+          node.databaseId,
+        ]);
+        clearNodePlacements([node.id, ...removedNodeIds]);
+        await refreshTopologyAndShared();
+        toast.success("Database deleted");
+      } else if (node.kind === "backup") {
+        const backupCardId = node.id.replace("backup-card:", "");
+        const backupCard = effectiveBackupCards.find(
+          (card) => card.id === backupCardId,
+        );
+        if (!backupCard) {
+          throw new Error("Backup card could not be resolved");
+        }
+        const linkedAutomationIds = effectiveAutomationCards
+          .filter(
+            (card) =>
+              card.backupCardId === backupCardId ||
+              (backupCard.databaseId != null &&
+                card.databaseId === backupCard.databaseId),
+          )
+          .map((card) => card.id);
+        const isPersistedBackupCard = persistedBackupCardIds.has(backupCardId);
+
+        if (backupCard.databaseId != null) {
+          await saveBackupSettingsForDatabase(backupCard.databaseId, {
+            ...createDefaultBackupSettings(backupCard.databaseId),
+            enabled: false,
+            automation_enabled: false,
+          });
+        }
+
+        if (isPersistedBackupCard) {
+          const deleteResponse = await authFetch(
+            `/api/topology/backup-cards/${backupCardId}`,
+            token,
+            { method: "DELETE" },
+            logout,
+          );
+          const deleteData = await deleteResponse.json().catch(() => ({}));
+          if (!deleteResponse.ok && deleteResponse.status !== 404) {
+            throw new Error(
+              deleteData?.error || "Failed to delete backup card",
+            );
+          }
+        }
+
+        const nextBackupCards = isPersistedBackupCard
+          ? backupCards.filter((card) => card.id !== backupCardId)
+          : backupCards;
+        const nextAutomationCards = automationCards.filter(
+          (card) =>
+            card.backupCardId !== backupCardId &&
+            (backupCard.databaseId == null ||
+              card.databaseId !== backupCard.databaseId),
+        );
+        if (isPersistedBackupCard) {
+          setBackupCards(nextBackupCards);
+        }
+        if (nextAutomationCards.length !== automationCards.length) {
+          setAutomationCards(nextAutomationCards);
+        }
+        if (
+          isPersistedBackupCard ||
+          nextAutomationCards.length !== automationCards.length
+        ) {
+          await persistServiceCards({
+            backupCards: nextBackupCards,
+            automationCards: nextAutomationCards,
+          });
+        }
+        clearNodePlacements([
+          node.id,
+          ...linkedAutomationIds.map((id) => `automation-card:${id}`),
+        ]);
+        await refreshTopologyAndShared();
+        toast.success("Backup target deleted");
+      } else if (node.kind === "automation") {
+        const automationCardId = node.id.replace("automation-card:", "");
+        const automationCard = effectiveAutomationCards.find(
+          (card) => card.id === automationCardId,
+        );
+        if (!automationCard) {
+          throw new Error("Automation card could not be resolved");
+        }
+        const isPersistedAutomationCard =
+          persistedAutomationCardIds.has(automationCardId);
+
+        if (automationCard.databaseId != null) {
+          const existingSettings =
+            backupSettingsByDatabaseId[automationCard.databaseId] ||
+            createDefaultBackupSettings(automationCard.databaseId);
+          await saveBackupSettingsForDatabase(automationCard.databaseId, {
+            ...existingSettings,
+            database_id: automationCard.databaseId,
+            automation_enabled: false,
+          });
+        }
+
+        if (isPersistedAutomationCard) {
+          const nextAutomationCards = automationCards.filter(
+            (card) => card.id !== automationCardId,
+          );
+          setAutomationCards(nextAutomationCards);
+          await persistServiceCards({
+            backupCards,
+            automationCards: nextAutomationCards,
+          });
+        }
+        clearNodePlacements([node.id]);
+        await refreshTopologyAndShared();
+        toast.success("Backup automation deleted");
+      }
+
+      setPendingNodeDeletion(null);
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to delete card",
+      );
+    } finally {
+      setNodeDeletionLoading(false);
+    }
+  }, [
+    automationCards,
+    backupCards,
+    backupSettingsByDatabaseId,
+    clearNodePlacements,
+    databases,
+    effectiveAutomationCards,
+    effectiveBackupCards,
+    logout,
+    persistedAutomationCardIds,
+    persistedBackupCardIds,
+    pendingNodeDeletion,
+    persistServiceCards,
+    projectsById,
+    removeServiceCardsForDatabases,
+    refreshTopologyAndShared,
+    saveBackupSettingsForDatabase,
+    token,
+  ]);
+
+  const confirmBackupAssignment = useCallback(async () => {
+    if (!pendingBackupAssignment) {
+      return;
+    }
+
+    const backupCard = effectiveBackupCards.find(
+      (card) => card.id === pendingBackupAssignment.backupCardId,
+    );
+    if (!backupCard) {
+      setPendingBackupAssignment(null);
+      return;
+    }
+
+    setBackupAssignmentLoading(true);
+    try {
+      if (
+        backupCard.databaseId != null &&
+        backupCard.databaseId !== pendingBackupAssignment.databaseId
+      ) {
+        throw new Error(
+          "This backup card is already attached to another database. Delete it or create another backup card instead of reusing it.",
+        );
+      }
+
+      const existingTargetBackupCard = effectiveBackupCards.find(
+        (card) =>
+          card.id !== backupCard.id &&
+          card.databaseId === pendingBackupAssignment.databaseId,
+      );
+      if (existingTargetBackupCard) {
+        throw new Error(
+          "This database already has a backup card attached. Remove the existing backup card first.",
+        );
+      }
+      if (!persistedBackupCardIds.has(backupCard.id)) {
+        throw new Error(
+          "This backup card is already driven by another database. Create a new backup service or copy from an existing database instead of reusing an attached card.",
+        );
+      }
+
+      await applyBackupCardToDatabase(
+        backupCard,
+        pendingBackupAssignment.databaseId,
+      );
+
+      const nextBackupCards = backupCards.map((card) =>
+        card.id === backupCard.id
+          ? { ...card, databaseId: pendingBackupAssignment.databaseId }
+          : card,
+      );
+      setBackupCards(nextBackupCards);
+
+      const linkedAutomations = automationCards.filter(
+        (card) =>
+          card.backupCardId === backupCard.id ||
+          card.databaseId === pendingBackupAssignment.databaseId,
+      );
+      let nextAutomationCards = automationCards.map((card) =>
+        linkedAutomations.some((linkedCard) => linkedCard.id === card.id)
+          ? {
+              ...card,
+              databaseId: pendingBackupAssignment.databaseId,
+            }
+          : card,
+      );
+      for (const automationCard of linkedAutomations) {
+        await applyAutomationCardToDatabase(
+          automationCard,
+          pendingBackupAssignment.databaseId,
+        );
+      }
+      setAutomationCards(nextAutomationCards);
+      await persistServiceCards({
+        backupCards: nextBackupCards,
+        automationCards: nextAutomationCards,
+      });
+
+      setPendingBackupAssignment(null);
+      toast.success(
+        `Backup config applied to ${pendingBackupAssignment.databaseName}`,
+      );
+      await refreshTopologyAndShared();
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Failed to apply backup config",
+      );
+    } finally {
+      setBackupAssignmentLoading(false);
+    }
+  }, [
+    applyAutomationCardToDatabase,
+    applyBackupCardToDatabase,
+    automationCards,
+    backupCards,
+    effectiveBackupCards,
+    pendingBackupAssignment,
+    persistedBackupCardIds,
+    persistServiceCards,
+    refreshTopologyAndShared,
+  ]);
+
   const handleContainerAction = useCallback(
-    async (container: ContainerInfo, action: "start" | "stop" | "restart") => {
+    async (
+      container: ContainerInfo,
+      action: "start" | "stop" | "restart",
+      databaseId?: number,
+    ) => {
       if (container.id === BASEFUL_SIMULATED_ID) return;
       setContainerActionLoading((prev) => ({
         ...prev,
@@ -1227,7 +3056,9 @@ export default function Containers() {
       }));
       try {
         const response = await authFetch(
-          `/api/docker/containers/${container.id}/${action}`,
+          databaseId
+            ? `/api/databases/${databaseId}/${action}`
+            : `/api/docker/containers/${container.id}/${action}`,
           token,
           { method: "POST" },
           logout,
@@ -1237,11 +3068,15 @@ export default function Containers() {
           throw new Error(data?.error || `Failed to ${action} container`);
         }
         toast.success(
-          action === "restart"
-            ? "Container restarted"
-            : `Container ${action === "start" ? "started" : "stopped"}`,
+          databaseId
+            ? action === "restart"
+              ? "Database restarted"
+              : `Database ${action === "start" ? "started" : "stopped"}`
+            : action === "restart"
+              ? "Container restarted"
+              : `Container ${action === "start" ? "started" : "stopped"}`,
         );
-        await fetchContainers();
+        await refreshTopologyAndShared();
       } catch (err) {
         toast.error(err instanceof Error ? err.message : "Action failed");
       } finally {
@@ -1251,7 +3086,7 @@ export default function Containers() {
         }));
       }
     },
-    [fetchContainers, logout, token],
+    [logout, refreshTopologyAndShared, token],
   );
 
   const openContainerLogs = useCallback(
@@ -1334,6 +3169,7 @@ export default function Containers() {
     await handleContainerAction(
       pendingContainerAction.container,
       pendingContainerAction.action,
+      pendingContainerAction.databaseId,
     );
     setPendingContainerAction(null);
   }, [handleContainerAction, pendingContainerAction]);
@@ -1531,9 +3367,52 @@ export default function Containers() {
     return output.length > 0 ? output : [<span key="fallback">{text}</span>];
   };
 
+  const visibleBackupCards = useMemo(
+    () =>
+      effectiveBackupCards.filter(
+        (card) =>
+          card.databaseId == null || visibleDatabaseIds.has(card.databaseId),
+      ),
+    [effectiveBackupCards, visibleDatabaseIds],
+  );
+  const visibleBackupCardIds = useMemo(
+    () => new Set(visibleBackupCards.map((card) => card.id)),
+    [visibleBackupCards],
+  );
+  const visibleAutomationCards = useMemo(
+    () =>
+      effectiveAutomationCards.filter((card) => {
+        if (card.backupCardId) {
+          return visibleBackupCardIds.has(card.backupCardId);
+        }
+        if (card.databaseId != null) {
+          return visibleDatabaseIds.has(card.databaseId);
+        }
+        return true;
+      }),
+    [effectiveAutomationCards, visibleBackupCardIds, visibleDatabaseIds],
+  );
+
   const topology = useMemo(
-    () => buildTopology(containers, projectsById, allUsers, proxyInfo),
-    [containers, projectsById, allUsers, proxyInfo],
+    () =>
+      buildTopology(
+        containers,
+        projectsById,
+        allUsers,
+        proxyInfo,
+        databases,
+        visibleBackupCards,
+        visibleAutomationCards,
+      ),
+    [
+      containers,
+      projectsById,
+      allUsers,
+      proxyInfo,
+      databases,
+      visibleBackupCards,
+      visibleAutomationCards,
+    ],
   );
 
   const highlightedGraph = useMemo(() => {
@@ -1555,6 +3434,18 @@ export default function Containers() {
     return { nodeIds, edgeIds };
   }, [selectedNodeId, topology.edges]);
 
+  const sortedDatabases = useMemo(
+    () => [...databases].sort((a, b) => a.name.localeCompare(b.name)),
+    [databases],
+  );
+  const copyableBackupDatabases = useMemo(
+    () =>
+      sortedDatabases.filter(
+        (database) => backupSettingsByDatabaseId[database.id]?.enabled,
+      ),
+    [backupSettingsByDatabaseId, sortedDatabases],
+  );
+
   const fitMapToViewport = useCallback(() => {
     if (!reactFlowInstance) return;
     void reactFlowInstance.fitView({
@@ -1565,17 +3456,40 @@ export default function Containers() {
     });
   }, [reactFlowInstance]);
 
+  const resetNodePlacements = useCallback(() => {
+    setCustomNodePositions({});
+    persistNodePositions({});
+    toast.success("Card placements reset");
+  }, []);
+
+  const resetMapView = useCallback(() => {
+    clearStoredViewport(viewportStorageKey);
+    setHasStoredViewport(false);
+    requestAnimationFrame(() => {
+      fitMapToViewport();
+    });
+  }, [fitMapToViewport, viewportStorageKey]);
+
   useEffect(() => {
     if (
       !reactFlowInstance ||
       mapInitializedRef.current ||
-      topology.nodes.length === 0
+      topology.nodes.length === 0 ||
+      !viewportHydrated
     ) {
       return;
     }
-    fitMapToViewport();
+    if (!hasStoredViewport) {
+      fitMapToViewport();
+    }
     mapInitializedRef.current = true;
-  }, [fitMapToViewport, reactFlowInstance, topology.nodes.length]);
+  }, [
+    fitMapToViewport,
+    hasStoredViewport,
+    reactFlowInstance,
+    topology.nodes.length,
+    viewportHydrated,
+  ]);
 
   const handleNodeOpen = useCallback(
     (node: GraphNode, containerMatch?: ContainerInfo) => {
@@ -1600,7 +3514,7 @@ export default function Containers() {
     [projectsById],
   );
 
-  const flowNodes = useMemo<TopologyFlowNode[]>(
+  const baseFlowNodes = useMemo<TopologyFlowNode[]>(
     () =>
       topology.nodes.map((node) => {
         const isContainer = node.kind === "container";
@@ -1609,21 +3523,45 @@ export default function Containers() {
             ? containers.find((c) => c.id === node.containerId)
             : undefined;
         const { width, height } = getNodeCardDimensions(node);
+        const customPosition = customNodePositions[node.id];
+        const nodeCenter = customPosition || { x: node.x, y: node.y };
         const hasIncoming = topology.edges.some(
           (edge) => edge.target === node.id,
         );
         const hasOutgoing = topology.edges.some(
           (edge) => edge.source === node.id,
         );
+        const hasIncomingRoute = topology.edges.some(
+          (edge) => edge.target === node.id && edge.kind === "route",
+        );
+        const hasOutgoingRoute = topology.edges.some(
+          (edge) => edge.source === node.id && edge.kind === "route",
+        );
+        const canAcceptIncomingConnection =
+          (node.kind === "container" && Boolean(node.databaseId)) ||
+          node.kind === "backup";
+        const canStartOutgoingConnection =
+          node.kind === "project" ||
+          (node.kind === "container" && Boolean(node.databaseId)) ||
+          node.kind === "automation";
+        const canDelete =
+          (node.kind === "project" &&
+            node.label.toLowerCase() !== "baseful" &&
+            hasPermission("create_projects")) ||
+          (node.kind === "container" &&
+            Boolean(node.databaseId) &&
+            canDeleteDatabases) ||
+          ((node.kind === "backup" || node.kind === "automation") &&
+            canManageBackups);
 
         return {
           id: node.id,
           type: "topologyNode",
           position: {
-            x: node.x - width / 2,
-            y: node.y - height / 2,
+            x: nodeCenter.x - width / 2,
+            y: nodeCenter.y - height / 2,
           },
-          draggable: false,
+          draggable: true,
           selectable: true,
           sourcePosition: Position.Right,
           targetPosition: Position.Left,
@@ -1636,6 +3574,13 @@ export default function Containers() {
             ).length,
             hasIncoming,
             hasOutgoing,
+            hasIncomingRoute,
+            hasOutgoingRoute,
+            canAttachProjectConnection: canStartOutgoingConnection,
+            canAcceptIncomingConnection,
+            canStartOutgoingConnection,
+            canDelete,
+            canOpenBackupPage: canManageBackups,
             containerMatch,
             actionLoading: containerActionLoading[node.containerId || node.id],
             isAdmin: Boolean(user?.isAdmin),
@@ -1644,12 +3589,16 @@ export default function Containers() {
             onOpenLogs: (container) => {
               void openContainerLogs(container);
             },
-            onContainerAction: (container, action) => {
-              setPendingContainerAction({ container, action });
+            onContainerAction: (container, action, databaseId) => {
+              setPendingContainerAction({ container, action, databaseId });
             },
             onOpenProxyLogs: () => {
               void openProxyLogs();
             },
+            onOpenBackupPage: (databaseId) => {
+              navigate(`/db/${databaseId}/backup`);
+            },
+            onRequestDelete: requestNodeDeletion,
           },
         };
       }),
@@ -1657,22 +3606,40 @@ export default function Containers() {
       topology.nodes,
       topology.edges,
       containers,
+      customNodePositions,
       selectedNodeId,
       highlightedGraph.nodeIds,
+      hasPermission,
+      canDeleteDatabases,
+      canManageBackups,
       containerActionLoading,
       user?.isAdmin,
       handleNodeOpen,
       openContainerLogs,
       openProxyLogs,
+      navigate,
+      requestNodeDeletion,
     ],
   );
+  const [flowNodes, setFlowNodes] = useState<TopologyFlowNode[]>(baseFlowNodes);
+
+  useEffect(() => {
+    setFlowNodes(baseFlowNodes);
+  }, [baseFlowNodes]);
 
   const flowEdges = useMemo<TopologyFlowEdge[]>(
     () =>
       topology.edges.map((edge) => {
         const isRelated = highlightedGraph.edgeIds.has(edge.id);
         const isRoute = edge.kind === "route";
-        const neutralStroke = isRelated ? "#6b7280" : "#3f3f46";
+        const isBackupEdge = edge.kind === "backup";
+        const neutralStroke = isBackupEdge
+          ? isRelated
+            ? "#38bdf8"
+            : "#0f766e"
+          : isRelated
+            ? "#6b7280"
+            : "#3f3f46";
         return {
           id: edge.id,
           source: edge.source,
@@ -1691,19 +3658,25 @@ export default function Containers() {
               : "smoothstep",
           animated: false,
           selectable: false,
-          interactionWidth: 0,
+          reconnectable: edge.kind === "belongs" || edge.kind === "backup",
+          interactionWidth:
+            edge.kind === "belongs" || edge.kind === "backup" ? 24 : 0,
           markerEnd: undefined,
           style: {
             stroke: neutralStroke,
             strokeOpacity: isRelated ? 1 : 0.4,
-            strokeWidth: isRoute
+            strokeWidth: isBackupEdge
               ? isRelated
-                ? 1.6
-                : 1.2
-              : isRelated
-                ? 2
-                : 1.5,
-            strokeDasharray: isRoute ? "4 6" : undefined,
+                ? 1.8
+                : 1.3
+              : isRoute
+                ? isRelated
+                  ? 1.6
+                  : 1.2
+                : isRelated
+                  ? 2
+                  : 1.5,
+            strokeDasharray: isBackupEdge ? "3 5" : isRoute ? "4 6" : undefined,
           },
         };
       }),
@@ -1712,6 +3685,269 @@ export default function Containers() {
 
   const nodeTypes = useMemo(() => ({ topologyNode: TopologyNodeCard }), []);
   const edgeTypes = useMemo(() => ({ proxyRoute: ProxyRouteEdge }), []);
+  const handleNodesChange = useCallback(
+    (changes: NodeChange<TopologyFlowNode>[]) => {
+      setFlowNodes((nodes) => applyNodeChanges(changes, nodes));
+    },
+    [],
+  );
+
+  const isValidMapConnection = useCallback(
+    (connectionLike: Connection | TopologyFlowEdge) => {
+      const connection: Connection = {
+        source: connectionLike.source,
+        target: connectionLike.target,
+        sourceHandle: connectionLike.sourceHandle ?? null,
+        targetHandle: connectionLike.targetHandle ?? null,
+      };
+      const sourceNode = flowNodes.find(
+        (node) => node.id === connection.source,
+      );
+      const targetNode = flowNodes.find(
+        (node) => node.id === connection.target,
+      );
+      if (!sourceNode || !targetNode || sourceNode.id === targetNode.id) {
+        return false;
+      }
+
+      const sourceGraphNode = sourceNode.data.node;
+      const targetGraphNode = targetNode.data.node;
+
+      const sourceIsProject = sourceGraphNode.kind === "project";
+      const targetIsProject = targetGraphNode.kind === "project";
+      const sourceIsDatabaseContainer =
+        sourceGraphNode.kind === "container" &&
+        Boolean(sourceGraphNode.databaseId);
+      const targetIsDatabaseContainer =
+        targetGraphNode.kind === "container" &&
+        Boolean(targetGraphNode.databaseId);
+      const sourceIsBackup = sourceGraphNode.kind === "backup";
+      const targetIsBackup = targetGraphNode.kind === "backup";
+      const sourceIsAutomation = sourceGraphNode.kind === "automation";
+      const targetIsAutomation = targetGraphNode.kind === "automation";
+      const automationNode = sourceIsAutomation
+        ? sourceGraphNode
+        : targetIsAutomation
+          ? targetGraphNode
+          : null;
+      const backupNode = sourceIsBackup
+        ? sourceGraphNode
+        : targetIsBackup
+          ? targetGraphNode
+          : null;
+
+      if (automationNode && backupNode) {
+        const backupCardId = backupNode.id.replace("backup-card:", "");
+        const automationCardId = automationNode.id.replace(
+          "automation-card:",
+          "",
+        );
+        const backupAlreadyLinked = visibleAutomationCards.some(
+          (card) =>
+            card.backupCardId === backupCardId && card.id !== automationCardId,
+        );
+        if (backupAlreadyLinked) {
+          return false;
+        }
+      }
+
+      return (
+        (sourceIsProject && targetIsDatabaseContainer) ||
+        (targetIsProject && sourceIsDatabaseContainer) ||
+        (sourceIsBackup && targetIsDatabaseContainer) ||
+        (targetIsBackup && sourceIsDatabaseContainer) ||
+        (sourceIsAutomation && targetIsBackup) ||
+        (targetIsAutomation && sourceIsBackup)
+      );
+    },
+    [flowNodes, visibleAutomationCards],
+  );
+
+  const handleMapConnect = useCallback(
+    async (connection: Connection) => {
+      if (!isValidMapConnection(connection)) {
+        return;
+      }
+
+      const sourceNode = flowNodes.find(
+        (node) => node.id === connection.source,
+      );
+      const targetNode = flowNodes.find(
+        (node) => node.id === connection.target,
+      );
+      if (!sourceNode || !targetNode) {
+        return;
+      }
+
+      const sourceGraphNode = sourceNode.data.node;
+      const targetGraphNode = targetNode.data.node;
+
+      const projectNode =
+        sourceGraphNode.kind === "project"
+          ? sourceGraphNode
+          : targetGraphNode.kind === "project"
+            ? targetGraphNode
+            : null;
+      const databaseNode =
+        sourceGraphNode.kind === "container" && sourceGraphNode.databaseId
+          ? sourceGraphNode
+          : targetGraphNode.kind === "container" && targetGraphNode.databaseId
+            ? targetGraphNode
+            : null;
+      const backupNode =
+        sourceGraphNode.kind === "backup"
+          ? sourceGraphNode
+          : targetGraphNode.kind === "backup"
+            ? targetGraphNode
+            : null;
+      const automationNode =
+        sourceGraphNode.kind === "automation"
+          ? sourceGraphNode
+          : targetGraphNode.kind === "automation"
+            ? targetGraphNode
+            : null;
+
+      try {
+        if (projectNode && databaseNode?.databaseId) {
+          const project = Object.values(projectsById).find(
+            (entry) =>
+              entry.name.toLowerCase() === projectNode.label.toLowerCase(),
+          );
+
+          if (!project) {
+            throw new Error("Unable to resolve target project");
+          }
+
+          const response = await authFetch(
+            `/api/databases/${databaseNode.databaseId}/project`,
+            token,
+            {
+              method: "PUT",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ projectId: project.id }),
+            },
+            logout,
+          );
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw new Error(data?.error || "Failed to update project");
+          }
+
+          toast.success(`Moved ${databaseNode.label} to ${project.name}`);
+          await refreshTopologyAndShared();
+          return;
+        }
+
+        if (backupNode && databaseNode?.databaseId) {
+          const backupCardId = backupNode.id.replace("backup-card:", "");
+          setPendingBackupAssignment({
+            backupCardId,
+            databaseId: databaseNode.databaseId,
+            databaseName: databaseNode.label,
+          });
+          return;
+        }
+
+        if (automationNode && backupNode) {
+          const automationCardId = automationNode.id.replace(
+            "automation-card:",
+            "",
+          );
+          const backupCardId = backupNode.id.replace("backup-card:", "");
+          const backupAlreadyLinked = effectiveAutomationCards.some(
+            (card) =>
+              card.backupCardId === backupCardId &&
+              card.id !== automationCardId,
+          );
+          if (backupAlreadyLinked) {
+            throw new Error(
+              "This backup target already has an automation attached",
+            );
+          }
+          const currentAutomationCard = effectiveAutomationCards.find(
+            (card) => card.id === automationCardId,
+          );
+          if (!persistedAutomationCardIds.has(automationCardId)) {
+            throw new Error(
+              "This automation card is already managed by a connected database. Remove it from that database before reusing it.",
+            );
+          }
+          if (
+            currentAutomationCard?.backupCardId &&
+            currentAutomationCard.backupCardId !== backupCardId
+          ) {
+            throw new Error(
+              "This automation card is already attached to another backup target. Delete it or create a new automation card instead of reusing it.",
+            );
+          }
+          const backupCard = effectiveBackupCards.find(
+            (card) => card.id === backupCardId,
+          );
+          if (backupCard?.databaseId) {
+            const databaseAlreadyAutomated = effectiveAutomationCards.some(
+              (card) =>
+                card.id !== automationCardId &&
+                card.databaseId === backupCard.databaseId,
+            );
+            if (databaseAlreadyAutomated) {
+              throw new Error(
+                "This database already has an automation card attached. Remove the existing automation card first.",
+              );
+            }
+          }
+          const nextAutomationCards = automationCards.map((card) =>
+            card.id === automationCardId
+              ? {
+                  ...card,
+                  backupCardId,
+                  databaseId: backupCard?.databaseId ?? null,
+                }
+              : card,
+          );
+          setAutomationCards(nextAutomationCards);
+          await persistServiceCards({
+            backupCards,
+            automationCards: nextAutomationCards,
+          });
+          if (backupCard?.databaseId) {
+            const automationCard = nextAutomationCards.find(
+              (card) => card.id === automationCardId,
+            );
+            if (automationCard) {
+              await applyAutomationCardToDatabase(
+                automationCard,
+                backupCard.databaseId,
+              );
+              await refreshTopologyAndShared();
+            }
+          }
+          toast.success("Automation linked to backup target");
+          return;
+        }
+      } catch (error) {
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : "Failed to update connection",
+        );
+      }
+    },
+    [
+      applyAutomationCardToDatabase,
+      automationCards,
+      backupCards,
+      effectiveAutomationCards,
+      effectiveBackupCards,
+      flowNodes,
+      isValidMapConnection,
+      logout,
+      persistedAutomationCardIds,
+      persistServiceCards,
+      projectsById,
+      refreshTopologyAndShared,
+      token,
+    ],
+  );
 
   const renderTerminalDialogContent = () => (
     <DialogContent className="sm:max-w-[85vw] w-full h-[85vh] flex flex-col p-0 gap-0 bg-[#0c0c0c] border-neutral-800 text-neutral-200 shadow-2xl overflow-hidden focus:outline-none">
@@ -1838,59 +4074,61 @@ export default function Containers() {
   const renderTerminalTrigger = (
     container: ContainerInfo,
     variant: "icon" | "button" = "icon",
-  ) => (
-    <Dialog onOpenChange={(open) => open && setSelectedContainer(container)}>
-      <DialogTrigger asChild>
-        {variant === "icon" ? (
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-8 w-8 text-muted-foreground hover:text-foreground"
-          >
-            <TerminalIcon size={14} />
-          </Button>
-        ) : (
-          <Button size="sm" className="gap-2">
-            <TerminalIcon size={14} />
-            Open Terminal
-          </Button>
-        )}
-      </DialogTrigger>
-      {renderTerminalDialogContent()}
-    </Dialog>
+  ) =>
+    !canExecContainers ? null : (
+      <Dialog onOpenChange={(open) => open && setSelectedContainer(container)}>
+        <DialogTrigger asChild>
+          {variant === "icon" ? (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 text-muted-foreground hover:text-foreground"
+            >
+              <TerminalIcon size={14} />
+            </Button>
+          ) : (
+            <Button size="sm" className="gap-2">
+              <TerminalIcon size={14} />
+              Open Terminal
+            </Button>
+          )}
+        </DialogTrigger>
+        {renderTerminalDialogContent()}
+      </Dialog>
+    );
+
+  const handleMapContextMenuCapture = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>) => {
+      setPendingCreationPosition(
+        resolveFlowPositionFromClient(event.clientX, event.clientY),
+      );
+    },
+    [resolveFlowPositionFromClient],
   );
 
   return (
     <div className="flex flex-col h-full">
-      <div className="flex flex-col border-b border-border p-4 gap-4 w-full">
-        <div className="flex items-center justify-between gap-3">
-          <h1 className="text-2xl font-medium text-neutral-100">Containers</h1>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={fetchContainers}
-            className="gap-2"
-          >
-            <ArrowClockwiseIcon className={loading ? "animate-spin" : ""} />
-            Refresh
-          </Button>
-        </div>
+      <div className="flex flex-row items-center gap-2 border-b border-border p-4 w-full">
+        <h1 className="text-2xl font-medium text-neutral-100">Topology</h1>
       </div>
 
       <div className="px-0 pb-0 flex-1 flex flex-col min-h-0">
-        {loading && containers.length === 0 ? (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {Array.from({ length: 6 }).map((_, i) => (
-              <Card key={i} className="border-border/50 bg-card/50">
-                <CardHeader className="pb-2">
-                  <Skeleton className="h-5 w-3/4 mb-2" />
-                  <Skeleton className="h-4 w-1/2" />
-                </CardHeader>
-                <CardContent>
-                  <Skeleton className="h-10 w-full" />
-                </CardContent>
-              </Card>
-            ))}
+        {!viewportHydrated || (loading && containers.length === 0) ? (
+          <div className="flex flex-1 min-h-105 items-center justify-center border border-white/[0.05] bg-card/30">
+            <div className="flex flex-col items-center gap-3 text-center">
+              <ArrowClockwiseIcon
+                size={28}
+                className="animate-spin text-neutral-400"
+              />
+              <div className="space-y-1">
+                <p className="text-sm font-medium text-neutral-200">
+                  Loading topology
+                </p>
+                <p className="text-xs text-neutral-500">
+                  Fetching containers, projects, and service cards.
+                </p>
+              </div>
+            </div>
           </div>
         ) : error ? (
           <div className="p-12 flex flex-col items-center justify-center text-center border border-dashed rounded-lg border-red-500/20 bg-red-500/5">
@@ -1899,78 +4137,203 @@ export default function Containers() {
             </p>
             <p className="text-sm text-neutral-400 max-w-md">{error}</p>
           </div>
-        ) : containers.length === 0 ? (
+        ) : topology.nodes.length === 0 ? (
           <div className="p-12 flex flex-col items-center justify-center text-center border border-dashed rounded-lg border-neutral-800">
             <CubeIcon size={48} className="text-neutral-700 mb-4" />
             <p className="text-neutral-300 font-medium mb-1">
-              No Containers Found
+              No Topology Items Found
             </p>
             <p className="text-sm text-neutral-500 max-w-md">
-              No containers managed by Baseful were detected on this server.
+              No projects, containers, or services managed by Baseful were
+              detected on this server.
             </p>
           </div>
         ) : (
           <div className="relative w-full flex-1 min-h-0">
-            <div className="relative h-full w-full overflow-hidden rounded-xl border border-white/[0.05] bg-transparent">
-              <ReactFlow<TopologyFlowNode, TopologyFlowEdge>
-                nodes={flowNodes}
-                edges={flowEdges}
-                nodeTypes={nodeTypes}
-                edgeTypes={edgeTypes}
-                onInit={(instance) => setReactFlowInstance(instance)}
-                onPaneClick={() => setSelectedNodeId(null)}
-                onNodeClick={
-                  ((_event, node) => {
-                    setSelectedNodeId(node.id);
-                  }) as NodeMouseHandler<TopologyFlowNode>
-                }
-                onViewportChange={setFlowViewport}
-                minZoom={MIN_SCALE}
-                maxZoom={MAX_SCALE}
-                nodesDraggable={false}
-                nodesConnectable={false}
-                elementsSelectable
-                panOnDrag
-                panOnScroll
-                zoomOnScroll={false}
-                zoomOnPinch
-                zoomOnDoubleClick={false}
-                selectionOnDrag={false}
-                connectionLineType={ConnectionLineType.SmoothStep}
-                defaultEdgeOptions={{
-                  type: "smoothstep",
-                  zIndex: 0,
-                  markerEnd: {
-                    type: MarkerType.ArrowClosed,
-                    width: 0,
-                    height: 0,
-                  },
-                }}
-                fitView={false}
-                proOptions={{ hideAttribution: true }}
-                className="bg-transparent"
-              >
-                <Background
-                  id="container-map-dots"
-                  variant={BackgroundVariant.Dots}
-                  gap={32}
-                  size={1.4}
-                  color="rgba(255,255,255,0.18)"
-                />
-              </ReactFlow>
-
-              <div className="absolute top-3 right-3 z-20 flex items-center gap-2 text-sm text-neutral-300 bg-card border border-white/10 rounded-md pl-2 pr-1 py-1">
-                <span>{Math.round(flowViewport.zoom * 100)}%</span>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={fitMapToViewport}
-                  className="h-7"
+            <ContextMenu>
+              <ContextMenuTrigger asChild>
+                <div
+                  ref={mapFrameRef}
+                  className="relative h-full w-full overflow-hidden bg-transparent"
+                  onContextMenuCapture={handleMapContextMenuCapture}
                 >
-                  Reset View
-                </Button>
-              </div>
-            </div>
+                  <ReactFlow<TopologyFlowNode, TopologyFlowEdge>
+                    nodes={flowNodes}
+                    edges={flowEdges}
+                    nodeTypes={nodeTypes}
+                    edgeTypes={edgeTypes}
+                    defaultViewport={flowViewport}
+                    onInit={(instance) => setReactFlowInstance(instance)}
+                    onNodesChange={handleNodesChange}
+                    onConnect={(connection) => {
+                      void handleMapConnect(connection);
+                    }}
+                    onReconnect={(_oldEdge, newConnection) => {
+                      void handleMapConnect(newConnection);
+                    }}
+                    isValidConnection={isValidMapConnection}
+                    onPaneClick={() => setSelectedNodeId(null)}
+                    onNodeClick={
+                      ((_event, node) => {
+                        setSelectedNodeId(node.id);
+                      }) as NodeMouseHandler<TopologyFlowNode>
+                    }
+                    onNodeDragStop={(_event, node) => {
+                      const topologyNode = node.data?.node;
+                      if (!topologyNode) {
+                        return;
+                      }
+
+                      const { width, height } =
+                        getNodeCardDimensions(topologyNode);
+                      setNodePlacement(node.id, {
+                        x: node.position.x + width / 2,
+                        y: node.position.y + height / 2,
+                      });
+
+                      if (topologyNode.kind !== "backup") {
+                        return;
+                      }
+
+                      const dragRect = {
+                        left: node.position.x,
+                        right: node.position.x + width,
+                        top: node.position.y,
+                        bottom: node.position.y + height,
+                      };
+                      const overlappingDatabaseNode = flowNodes.find(
+                        (candidate) => {
+                          if (
+                            candidate.id === node.id ||
+                            candidate.data.node.kind !== "container" ||
+                            !candidate.data.node.databaseId
+                          ) {
+                            return false;
+                          }
+
+                          const dimensions = getNodeCardDimensions(
+                            candidate.data.node,
+                          );
+                          const candidateRect = {
+                            left: candidate.position.x,
+                            right: candidate.position.x + dimensions.width,
+                            top: candidate.position.y,
+                            bottom: candidate.position.y + dimensions.height,
+                          };
+
+                          return !(
+                            dragRect.right < candidateRect.left ||
+                            dragRect.left > candidateRect.right ||
+                            dragRect.bottom < candidateRect.top ||
+                            dragRect.top > candidateRect.bottom
+                          );
+                        },
+                      );
+
+                      if (overlappingDatabaseNode?.data.node.databaseId) {
+                        setPendingBackupAssignment({
+                          backupCardId: topologyNode.id.replace(
+                            "backup-card:",
+                            "",
+                          ),
+                          databaseId:
+                            overlappingDatabaseNode.data.node.databaseId,
+                          databaseName: overlappingDatabaseNode.data.node.label,
+                        });
+                      }
+                    }}
+                    onViewportChange={setFlowViewport}
+                    minZoom={MIN_SCALE}
+                    maxZoom={MAX_SCALE}
+                    nodesDraggable
+                    nodesConnectable
+                    edgesReconnectable
+                    elementsSelectable
+                    panOnDrag
+                    panOnScroll
+                    zoomOnScroll={false}
+                    zoomOnPinch
+                    zoomOnDoubleClick={false}
+                    selectionOnDrag={false}
+                    connectionLineType={ConnectionLineType.SmoothStep}
+                    defaultEdgeOptions={{
+                      type: "smoothstep",
+                      zIndex: 0,
+                      markerEnd: {
+                        type: MarkerType.ArrowClosed,
+                        width: 0,
+                        height: 0,
+                      },
+                    }}
+                    fitView={false}
+                    proOptions={{ hideAttribution: true }}
+                    className="bg-transparent"
+                  >
+                    <Background
+                      id="container-map-dots"
+                      variant={BackgroundVariant.Dots}
+                      gap={32}
+                      size={1.4}
+                      color="rgba(255,255,255,0.18)"
+                    />
+                  </ReactFlow>
+
+                  <div className="absolute top-3 left-3 z-20 rounded-md border border-white/10 bg-card/95 px-3 py-2 text-xs text-neutral-400 shadow-sm backdrop-blur">
+                    Right-click anywhere on the map to create a card. Drag cards
+                    to store custom placements locally.
+                  </div>
+
+                  <div className="absolute top-3 right-3 z-20 flex items-center gap-2 text-sm text-neutral-300 bg-card border border-white/10 rounded-md pl-2 pr-1 py-1">
+                    <span>{Math.round(flowViewport.zoom * 100)}%</span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={resetNodePlacements}
+                      className="h-7"
+                    >
+                      Reset Placement
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={resetMapView}
+                      className="h-7"
+                    >
+                      Reset View
+                    </Button>
+                  </div>
+                </div>
+              </ContextMenuTrigger>
+              <ContextMenuContent className="w-60">
+                <ContextMenuLabel>Create On Map</ContextMenuLabel>
+                <ContextMenuSeparator />
+                <ContextMenuItem onSelect={() => openCreateDialog("project")}>
+                  <FolderPlusIcon size={16} />
+                  New Project
+                </ContextMenuItem>
+                <ContextMenuItem
+                  onSelect={() => openCreateDialog("database")}
+                  disabled={Object.keys(projectsById).length === 0}
+                >
+                  <DatabaseIcon size={16} />
+                  New Database
+                </ContextMenuItem>
+                <ContextMenuItem
+                  onSelect={() => openCreateDialog("backup")}
+                  disabled={!canManageBackups}
+                >
+                  <HardDrivesIcon size={16} />
+                  New Backup Service
+                </ContextMenuItem>
+                <ContextMenuItem
+                  onSelect={() => openCreateDialog("automation")}
+                  disabled={!canManageBackups}
+                >
+                  <ClockCounterClockwiseIcon size={16} />
+                  New Automation Service
+                </ContextMenuItem>
+              </ContextMenuContent>
+            </ContextMenu>
 
             <ManageProjectDialog
               open={manageProjectDialogOpen}
@@ -1978,6 +4341,323 @@ export default function Containers() {
               project={selectedManageProject}
               onProjectUpdated={fetchContainers}
             />
+
+            <CreateProjectDialog
+              open={createProjectOpen}
+              onOpenChange={(open) => {
+                setCreateProjectOpen(open);
+                if (!open) {
+                  setPendingCreationPosition(null);
+                }
+              }}
+              onProjectCreated={(project) => {
+                void handleProjectCreated(project);
+              }}
+            />
+
+            <CreateDatabaseDialog
+              open={createDatabaseOpen}
+              onOpenChange={(open) => {
+                setCreateDatabaseOpen(open);
+                if (!open) {
+                  setPendingCreationPosition(null);
+                }
+              }}
+              navigateOnCreate={false}
+              hideProjectSelector
+              allowProjectless
+              startStopped
+              onDatabaseCreated={(database) => {
+                void handleDatabaseCreated(database);
+              }}
+            />
+
+            <Dialog
+              open={createBackupOpen}
+              onOpenChange={(open) => {
+                setCreateBackupOpen(open);
+                if (!open) {
+                  setPendingCreationPosition(null);
+                }
+              }}
+            >
+              <DialogContent className="p-0 gap-0 bg-card">
+                <DialogHeader className="border-b border-border p-4">
+                  <DialogTitle>Create Backup Service</DialogTitle>
+                  <DialogDescription>
+                    Create a reusable backup config card. Attach it to a
+                    database later on the map.
+                  </DialogDescription>
+                </DialogHeader>
+                <form onSubmit={handleBackupSubmit} className="p-4 space-y-4">
+                  <div className="grid gap-2">
+                    <Label htmlFor="backup-copy-source">
+                      Copy From Existing Backup (optional)
+                    </Label>
+                    <Select
+                      value={backupCopySourceId || "__scratch__"}
+                      onValueChange={(value) => {
+                        const nextValue = value === "__scratch__" ? "" : value;
+                        setBackupCopySourceId(nextValue);
+                        const databaseId = Number.parseInt(nextValue, 10);
+                        const nextSettings = nextValue
+                          ? backupSettingsByDatabaseId[databaseId] ||
+                            createDefaultBackupSettings(0)
+                          : createDefaultBackupSettings(0);
+                        setBackupForm({
+                          ...nextSettings,
+                          database_id: 0,
+                          enabled: true,
+                          provider: nextSettings.provider || "s3",
+                        });
+                      }}
+                    >
+                      <SelectTrigger id="backup-copy-source">
+                        <SelectValue placeholder="Start from scratch" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__scratch__">
+                          Start from scratch
+                        </SelectItem>
+                        {copyableBackupDatabases.map((database) => (
+                          <SelectItem
+                            key={database.id}
+                            value={String(database.id)}
+                          >
+                            {database.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="grid gap-2">
+                    <Label htmlFor="backup-endpoint">Endpoint</Label>
+                    <Input
+                      id="backup-endpoint"
+                      placeholder="https://s3.amazonaws.com"
+                      value={backupForm.endpoint}
+                      onChange={(event) =>
+                        setBackupForm((prev) => ({
+                          ...prev,
+                          endpoint: event.target.value,
+                        }))
+                      }
+                      required
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="grid gap-2">
+                      <Label htmlFor="backup-region">Region</Label>
+                      <Input
+                        id="backup-region"
+                        value={backupForm.region}
+                        onChange={(event) =>
+                          setBackupForm((prev) => ({
+                            ...prev,
+                            region: event.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                    <div className="grid gap-2">
+                      <Label htmlFor="backup-bucket">Bucket</Label>
+                      <Input
+                        id="backup-bucket"
+                        value={backupForm.bucket}
+                        onChange={(event) =>
+                          setBackupForm((prev) => ({
+                            ...prev,
+                            bucket: event.target.value,
+                          }))
+                        }
+                        required
+                      />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="grid gap-2">
+                      <Label htmlFor="backup-access-key">Access Key</Label>
+                      <Input
+                        id="backup-access-key"
+                        value={backupForm.access_key}
+                        onChange={(event) =>
+                          setBackupForm((prev) => ({
+                            ...prev,
+                            access_key: event.target.value,
+                          }))
+                        }
+                        required
+                      />
+                    </div>
+                    <div className="grid gap-2">
+                      <Label htmlFor="backup-secret-key">Secret Key</Label>
+                      <Input
+                        id="backup-secret-key"
+                        type="password"
+                        value={backupForm.secret_key}
+                        onChange={(event) =>
+                          setBackupForm((prev) => ({
+                            ...prev,
+                            secret_key: event.target.value,
+                          }))
+                        }
+                        required
+                      />
+                    </div>
+                  </div>
+                  <div className="grid gap-2">
+                    <Label htmlFor="backup-path-prefix">Path Prefix</Label>
+                    <Input
+                      id="backup-path-prefix"
+                      value={backupForm.path_prefix}
+                      onChange={(event) =>
+                        setBackupForm((prev) => ({
+                          ...prev,
+                          path_prefix: event.target.value,
+                        }))
+                      }
+                    />
+                  </div>
+                  <div className="rounded-lg border border-border p-3 space-y-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <Label htmlFor="backup-encryption">Encryption</Label>
+                        <p className="text-xs text-neutral-500">
+                          Encrypt snapshots before upload.
+                        </p>
+                      </div>
+                      <Switch
+                        id="backup-encryption"
+                        checked={backupForm.encryption_enabled}
+                        onCheckedChange={(checked) =>
+                          setBackupForm((prev) => ({
+                            ...prev,
+                            encryption_enabled: checked,
+                          }))
+                        }
+                      />
+                    </div>
+                    {backupForm.encryption_enabled && (
+                      <div className="grid gap-2">
+                        <Label htmlFor="backup-public-key">
+                          Encryption Public Key
+                        </Label>
+                        <Input
+                          id="backup-public-key"
+                          value={backupForm.encryption_public_key}
+                          onChange={(event) =>
+                            setBackupForm((prev) => ({
+                              ...prev,
+                              encryption_public_key: event.target.value,
+                            }))
+                          }
+                          required={backupForm.encryption_enabled}
+                        />
+                      </div>
+                    )}
+                  </div>
+                  <DialogFooter>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => setCreateBackupOpen(false)}
+                    >
+                      Cancel
+                    </Button>
+                    <Button type="submit" disabled={backupSubmitting}>
+                      {backupSubmitting ? "Saving..." : "Create Backup Service"}
+                    </Button>
+                  </DialogFooter>
+                </form>
+              </DialogContent>
+            </Dialog>
+
+            <Dialog
+              open={createAutomationOpen}
+              onOpenChange={(open) => {
+                setCreateAutomationOpen(open);
+                if (!open) {
+                  setPendingCreationPosition(null);
+                }
+              }}
+            >
+              <DialogContent className="p-0 gap-0 bg-card">
+                <DialogHeader className="border-b border-border p-4">
+                  <DialogTitle>Create Automation Service</DialogTitle>
+                  <DialogDescription>
+                    Create a reusable automation card. Attach it to a backup or
+                    database later on the map.
+                  </DialogDescription>
+                </DialogHeader>
+                <form
+                  onSubmit={handleAutomationSubmit}
+                  className="p-4 space-y-4"
+                >
+                  <div className="rounded-lg border border-border p-3 bg-muted/20">
+                    <p className="text-sm font-medium text-neutral-200">
+                      Backup automation
+                    </p>
+                    <p className="text-xs text-neutral-500">
+                      This card schedules a connected backup target. Direct
+                      database links are not supported.
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-border p-3 flex items-center justify-between gap-3">
+                    <div>
+                      <Label htmlFor="automation-enabled">Automation</Label>
+                      <p className="text-xs text-neutral-500">
+                        Keep scheduled backups enabled after creation.
+                      </p>
+                    </div>
+                    <Switch
+                      id="automation-enabled"
+                      checked={automationForm.automationEnabled}
+                      onCheckedChange={(checked) =>
+                        setAutomationForm((prev) => ({
+                          ...prev,
+                          automationEnabled: checked,
+                        }))
+                      }
+                    />
+                  </div>
+                  <div className="grid gap-2">
+                    <Label htmlFor="automation-frequency">Frequency</Label>
+                    <Select
+                      value={automationForm.automationFrequency}
+                      onValueChange={(value) =>
+                        setAutomationForm((prev) => ({
+                          ...prev,
+                          automationFrequency: value,
+                        }))
+                      }
+                    >
+                      <SelectTrigger id="automation-frequency">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="hourly">Every hour</SelectItem>
+                        <SelectItem value="daily">Every day</SelectItem>
+                        <SelectItem value="weekly">Every week</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <DialogFooter>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => setCreateAutomationOpen(false)}
+                    >
+                      Cancel
+                    </Button>
+                    <Button type="submit" disabled={automationSubmitting}>
+                      {automationSubmitting
+                        ? "Saving..."
+                        : "Create Automation Service"}
+                    </Button>
+                  </DialogFooter>
+                </form>
+              </DialogContent>
+            </Dialog>
 
             <Dialog open={logsDialogOpen} onOpenChange={setLogsDialogOpen}>
               <DialogContent className="sm:max-w-[85vw] w-full h-[75vh] flex flex-col p-0 gap-0 bg-[#0c0c0c] border-neutral-800 text-neutral-200 overflow-hidden">
@@ -2036,16 +4716,16 @@ export default function Containers() {
               </DialogContent>
             </Dialog>
 
-              <ConfirmDialog
-                open={Boolean(pendingContainerAction)}
-                onOpenChange={(open) => {
-                  if (!open) setPendingContainerAction(null);
-                }}
-                title={pendingActionTitle}
-                description={pendingActionDescription}
-                onConfirm={() => void confirmContainerAction()}
-                confirmText={
-                  pendingContainerAction?.action === "restart"
+            <ConfirmDialog
+              open={Boolean(pendingContainerAction)}
+              onOpenChange={(open) => {
+                if (!open) setPendingContainerAction(null);
+              }}
+              title={pendingActionTitle}
+              description={pendingActionDescription}
+              onConfirm={() => void confirmContainerAction()}
+              confirmText={
+                pendingContainerAction?.action === "restart"
                   ? "Restart"
                   : pendingContainerAction?.action === "stop"
                     ? "Stop"
@@ -2063,6 +4743,42 @@ export default function Containers() {
                     ] === pendingContainerAction.action
                   : false
               }
+            />
+
+            <ConfirmDialog
+              open={Boolean(pendingBackupAssignment)}
+              onOpenChange={(open) => {
+                if (!open) {
+                  setPendingBackupAssignment(null);
+                }
+              }}
+              title="Apply backup config to database?"
+              description={
+                pendingBackupAssignment
+                  ? `This will overwrite the backup configuration for "${pendingBackupAssignment.databaseName}" with the dragged backup card settings.`
+                  : "This will overwrite the target database backup configuration."
+              }
+              onConfirm={() => void confirmBackupAssignment()}
+              confirmText="Apply Backup Config"
+              loading={backupAssignmentLoading}
+            />
+
+            <ConfirmDialog
+              open={Boolean(pendingNodeDeletion)}
+              onOpenChange={(open) => {
+                if (!open) {
+                  setPendingNodeDeletion(null);
+                }
+              }}
+              title={pendingNodeDeletion?.title || "Delete item?"}
+              description={
+                pendingNodeDeletion?.description ||
+                "This will permanently delete the selected item."
+              }
+              onConfirm={() => void confirmNodeDeletion()}
+              confirmText={pendingNodeDeletion?.confirmText || "Delete"}
+              confirmVariant="destructive"
+              loading={nodeDeletionLoading}
             />
 
             <Drawer

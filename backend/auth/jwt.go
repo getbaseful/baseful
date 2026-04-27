@@ -4,10 +4,20 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+)
+
+const defaultProxyTokenTTL = 90 * 24 * time.Hour
+
+var (
+	fallbackSecretsMu sync.Mutex
+	fallbackSecrets   = map[string]string{}
 )
 
 // JWTClaims represents the claims in the JWT token
@@ -33,17 +43,129 @@ type TokenRecord struct {
 	Revoked    bool
 }
 
-// GetJWTSecret returns the JWT secret from environment or generates one
-func GetJWTSecret() string {
-	secret := os.Getenv("JWT_SECRET")
-	if secret == "" {
-		// Generate a random secret if not set
-		b := make([]byte, 32)
-		rand.Read(b)
-		secret = hex.EncodeToString(b)
-		fmt.Println("Warning: JWT_SECRET not set, generated random secret")
+func getConfiguredSecret(keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
 	}
+	return ""
+}
+
+func getFallbackSecret(cacheKey string) string {
+	fallbackSecretsMu.Lock()
+	defer fallbackSecretsMu.Unlock()
+
+	if secret := fallbackSecrets[cacheKey]; secret != "" {
+		return secret
+	}
+
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	secret := hex.EncodeToString(b)
+	fallbackSecrets[cacheKey] = secret
+	fmt.Printf("Warning: %s not set, generated process-local fallback secret\n", cacheKey)
 	return secret
+}
+
+func uniqueStrings(values []string) []string {
+	seen := map[string]struct{}{}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func getUserSessionSecrets() []string {
+	secrets := uniqueStrings([]string{
+		getConfiguredSecret("USER_JWT_SECRET", "SESSION_JWT_SECRET", "JWT_SECRET"),
+		strings.TrimSpace(os.Getenv("JWT_SECRET")),
+	})
+	if len(secrets) > 0 {
+		return secrets
+	}
+	return []string{getFallbackSecret("USER_JWT_SECRET")}
+}
+
+func getProxyJWTSecrets() []string {
+	secrets := uniqueStrings([]string{
+		getConfiguredSecret("PROXY_JWT_SECRET", "JWT_SECRET"),
+		strings.TrimSpace(os.Getenv("JWT_SECRET")),
+	})
+	if len(secrets) > 0 {
+		return secrets
+	}
+	return []string{getFallbackSecret("PROXY_JWT_SECRET")}
+}
+
+func getAllValidationSecrets() []string {
+	return uniqueStrings(append(getUserSessionSecrets(), getProxyJWTSecrets()...))
+}
+
+func parseProxyTokenTTL(raw string) (time.Duration, error) {
+	trimmed := strings.TrimSpace(strings.ToLower(raw))
+	if trimmed == "" {
+		return 0, fmt.Errorf("duration is empty")
+	}
+	if strings.HasSuffix(trimmed, "d") {
+		daysValue := strings.TrimSuffix(trimmed, "d")
+		var days int
+		if _, err := fmt.Sscanf(daysValue, "%d", &days); err != nil {
+			return 0, err
+		}
+		if days <= 0 {
+			return 0, fmt.Errorf("days must be positive")
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+	return time.ParseDuration(trimmed)
+}
+
+// GetProxyTokenTTL returns the configured lifetime for newly-issued proxy tokens.
+func GetProxyTokenTTL() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("PROXY_TOKEN_TTL")); raw != "" {
+		if ttl, err := parseProxyTokenTTL(raw); err == nil && ttl > 0 {
+			return ttl
+		}
+		fmt.Printf("Warning: invalid PROXY_TOKEN_TTL %q, using default %s\n", raw, defaultProxyTokenTTL)
+	}
+	return defaultProxyTokenTTL
+}
+
+// NewProxyTokenWindow returns issue and expiry timestamps for new proxy tokens.
+func NewProxyTokenWindow() (time.Time, time.Time) {
+	issuedAt := time.Now().UTC()
+	return issuedAt, issuedAt.Add(GetProxyTokenTTL())
+}
+
+func isLocalProxyHost(host string) bool {
+	trimmed := strings.TrimSpace(strings.Trim(host, "[]"))
+	if trimmed == "" {
+		return true
+	}
+	if strings.EqualFold(trimmed, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(trimmed); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// RecommendedProxySSLMode returns the safest libpq sslmode that should work for the host.
+func RecommendedProxySSLMode(host string) string {
+	if isLocalProxyHost(host) {
+		return "require"
+	}
+	return "verify-full"
 }
 
 // GenerateTokenID generates a unique token ID
@@ -58,14 +180,13 @@ func GenerateTokenID() (string, error) {
 
 // GenerateJWT generates a new JWT token for a database (Legacy proxy token)
 func GenerateJWT(databaseID int, userID int, tokenID string) (string, error) {
-	issuedAt := time.Now().UTC()
-	expiresAt := issuedAt.AddDate(2, 0, 0)
+	issuedAt, expiresAt := NewProxyTokenWindow()
 	return GenerateJWTWithTimestamps(databaseID, userID, tokenID, issuedAt, expiresAt)
 }
 
 // GenerateJWTWithTimestamps generates a deterministic JWT for a token identity and timestamp pair.
 func GenerateJWTWithTimestamps(databaseID int, userID int, tokenID string, issuedAt time.Time, expiresAt time.Time) (string, error) {
-	secret := GetJWTSecret()
+	secret := getProxyJWTSecrets()[0]
 	issuedAt = issuedAt.UTC()
 	expiresAt = expiresAt.UTC()
 
@@ -90,7 +211,7 @@ func GenerateJWTWithTimestamps(databaseID int, userID int, tokenID string, issue
 
 // GenerateUserJWT generates a session token for a user
 func GenerateUserJWT(userID int, email string, isAdmin bool) (string, error) {
-	secret := GetJWTSecret()
+	secret := getUserSessionSecrets()[0]
 
 	// Session expires in 7 days
 	expiresAt := time.Now().Add(7 * 24 * time.Hour)
@@ -115,26 +236,32 @@ func GenerateUserJWT(userID int, email string, isAdmin bool) (string, error) {
 
 // ValidateJWT validates a JWT token and returns the claims
 func ValidateJWT(tokenString string) (*JWTClaims, error) {
-	secret := GetJWTSecret()
-
 	parser := jwt.NewParser(
 		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
 		jwt.WithIssuer("baseful"),
 		jwt.WithLeeway(30*time.Second),
 	)
-	token, err := parser.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
-		return []byte(secret), nil
-	})
 
-	if err != nil {
-		return nil, err
+	var lastErr error
+	for _, secret := range getAllValidationSecrets() {
+		token, err := parser.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
+			return []byte(secret), nil
+		})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if claims, ok := token.Claims.(*JWTClaims); ok && token.Valid {
+			return claims, nil
+		}
+		lastErr = fmt.Errorf("invalid token")
 	}
 
-	if claims, ok := token.Claims.(*JWTClaims); ok && token.Valid {
-		return claims, nil
+	if lastErr == nil {
+		lastErr = fmt.Errorf("invalid token")
 	}
-
-	return nil, fmt.Errorf("invalid token")
+	return nil, lastErr
 }
 
 // GenerateConnectionString generates a PostgreSQL proxy connection string
@@ -163,6 +290,9 @@ func GetProxyPort() string {
 // GetProxyHost returns the PostgreSQL proxy host from environment
 func GetProxyHost() string {
 	host := os.Getenv("PROXY_HOST")
+	if host == "" {
+		host = os.Getenv("DOMAIN_NAME")
+	}
 	if host == "" {
 		host = os.Getenv("PUBLIC_IP")
 	}

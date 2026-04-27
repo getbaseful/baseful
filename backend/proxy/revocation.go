@@ -59,7 +59,6 @@ func (s *RevocationStore) IsRevoked(tokenID string) bool {
 
 	// Check if entry has expired (cleanup after 24 hours)
 	if time.Since(entry.RevokedAt) > 24*time.Hour {
-		delete(s.tokens, tokenID)
 		return false
 	}
 

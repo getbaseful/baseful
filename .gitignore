@@ -4,6 +4,8 @@ backend/proxy-server
 **/bin/
 **/obj/
 
+.gocache/
+
 # Databases
 backend/*.db
 backend/*.db-shm

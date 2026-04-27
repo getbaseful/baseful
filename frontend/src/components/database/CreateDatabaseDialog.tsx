@@ -33,17 +33,36 @@ interface Project {
 }
 
 interface CreateDatabaseDialogProps {
-  onDatabaseCreated: () => void;
+  onDatabaseCreated: (database?: {
+    id: number;
+    name: string;
+    type: string;
+    projectId: number;
+    containerId?: string;
+    internalHost?: string;
+  }) => void;
   children?: React.ReactNode;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  navigateOnCreate?: boolean;
+  hideProjectSelector?: boolean;
+  allowProjectless?: boolean;
+  startStopped?: boolean;
 }
 
 export default function CreateDatabaseDialog({
   onDatabaseCreated,
   children,
+  open: controlledOpen,
+  onOpenChange: controlledOnOpenChange,
+  navigateOnCreate = true,
+  hideProjectSelector = false,
+  allowProjectless = false,
+  startStopped = false,
 }: CreateDatabaseDialogProps) {
   const { setSelectedDatabase } = useDatabase();
   const navigate = useNavigate();
-  const [open, setOpen] = useState(false);
+  const [internalOpen, setInternalOpen] = useState(false);
   const [name, setName] = useState("");
   const [type, setType] = useState("postgresql");
   const [version, setVersion] = useState("17");
@@ -58,6 +77,9 @@ export default function CreateDatabaseDialog({
   const [statusMessage, setStatusMessage] = useState("");
 
   const { token, logout } = useAuth();
+  const open = controlledOpen ?? internalOpen;
+  const setOpen = controlledOnOpenChange ?? setInternalOpen;
+  const shouldRenderTrigger = Boolean(children) || controlledOpen === undefined;
 
   useEffect(() => {
     if (open && token) {
@@ -78,7 +100,7 @@ export default function CreateDatabaseDialog({
       const data = await response.json();
       if (Array.isArray(data)) {
         setProjects(data);
-        if (data.length > 0 && !projectId) {
+        if (!hideProjectSelector && data.length > 0 && !projectId) {
           setProjectId(String(data[0].id));
         }
       } else {
@@ -97,7 +119,9 @@ export default function CreateDatabaseDialog({
     setProgress(0);
     setStatusMessage("Initializing...");
 
-    if (!projectId) {
+    const parsedProjectId = projectId ? parseInt(projectId) : 0;
+
+    if (!allowProjectless && !projectId) {
       setError("Please select a project");
       setLoading(false);
       return;
@@ -118,7 +142,7 @@ export default function CreateDatabaseDialog({
           name,
           type,
           version,
-          projectId: parseInt(projectId),
+          projectId: parsedProjectId,
           maxCpu,
           maxRamMb,
           maxStorageMb,
@@ -151,47 +175,104 @@ export default function CreateDatabaseDialog({
 
         for (const line of lines) {
           if (!line.trim()) continue;
+
+          let update: any;
           try {
-            const update = JSON.parse(line);
+            update = JSON.parse(line);
+          } catch (parseError) {
+            console.error("Error parsing stream line:", parseError);
+            continue;
+          }
 
-            if (update.status === "error") {
-              throw new Error(update.message);
-            }
+          if (update.status === "error") {
+            throw new Error(update.message);
+          }
 
-            setStatusMessage(update.message);
-            if (update.progress !== undefined) {
-              setProgress(update.progress);
-            }
+          setStatusMessage(update.message);
+          if (update.progress !== undefined) {
+            setProgress(update.progress);
+          }
 
-            if (update.status === "success") {
-              const data = update.data;
-              // Auto-select the new database and navigate to it
-              if (data.id) {
-                const newDatabase = {
-                  id: data.id,
-                  name: name,
-                  type: type,
-                  host: data.internal_host || "",
-                  port: 5432,
-                  status: "active",
-                  projectId: parseInt(projectId),
-                };
-                setSelectedDatabase(newDatabase);
-                navigate(`/db/${data.id}/dashboard`);
+          if (update.status === "success") {
+            const data = update.data;
+            // Auto-select the new database and navigate to it
+            if (data.id) {
+              let finalStatus: "stopped" | "active" = "active";
+
+              if (startStopped) {
+                setStatusMessage("Stopping database...");
+                const stopResponse = await authFetch(
+                  `/api/databases/${data.id}/stop`,
+                  token,
+                  { method: "POST" },
+                  logout,
+                );
+
+                if (stopResponse.status === 401) {
+                  logout();
+                  return;
+                }
+
+                const stopData = await stopResponse.json().catch(() => ({}));
+                if (!stopResponse.ok) {
+                  const createdDatabase = {
+                    id: data.id,
+                    name,
+                    type,
+                    host: data.internal_host || "",
+                    port: 5432,
+                    status: "active" as const,
+                    projectId: parsedProjectId,
+                  };
+                  setSelectedDatabase(createdDatabase);
+                  onDatabaseCreated({
+                    id: data.id,
+                    name,
+                    type,
+                    projectId: parsedProjectId,
+                    containerId: data.container_id,
+                    internalHost: data.internal_host || "",
+                  });
+                  throw new Error(
+                    stopData?.error ||
+                      "Database was created, but stopping it failed. It is currently running.",
+                  );
+                }
+
+                finalStatus = "stopped";
               }
 
-              setName("");
-              setType("postgresql");
-              setVersion("17");
-              setProjectId("");
-              setMaxCpu(1);
-              setMaxRamMb(512);
-              setMaxStorageMb(1024);
-              setOpen(false);
-              onDatabaseCreated();
+              const newDatabase = {
+                id: data.id,
+                name: name,
+                type: type,
+                host: data.internal_host || "",
+                port: 5432,
+                status: finalStatus,
+                projectId: parsedProjectId,
+              };
+              setSelectedDatabase(newDatabase);
+              if (navigateOnCreate) {
+                navigate(`/db/${data.id}/dashboard`);
+              }
+              onDatabaseCreated({
+                id: data.id,
+                name,
+                type,
+                projectId: parsedProjectId,
+                containerId: data.container_id,
+                internalHost: data.internal_host || "",
+              });
             }
-          } catch (e) {
-            console.error("Error parsing stream line:", e);
+
+            setName("");
+            setType("postgresql");
+            setVersion("17");
+            setProjectId("");
+            setMaxCpu(1);
+            setMaxRamMb(512);
+            setMaxStorageMb(1024);
+            setOpen(false);
           }
         }
       }
@@ -206,13 +287,15 @@ export default function CreateDatabaseDialog({
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        {children || (
-          <Button variant="ghost" size="sm" className="cursor-pointer">
-            <PlusIcon size={16} />
-          </Button>
-        )}
-      </DialogTrigger>
+      {shouldRenderTrigger ? (
+        <DialogTrigger asChild>
+          {children || (
+            <Button variant="ghost" size="sm" className="cursor-pointer">
+              <PlusIcon size={16} />
+            </Button>
+          )}
+        </DialogTrigger>
+      ) : null}
       <DialogContent className="p-0 gap-0! bg-card">
         <DialogHeader className="border-b border-border p-4 mb-0! gap-0">
           <DialogTitle className="text-xl font-medium">Create Database</DialogTitle>
@@ -238,27 +321,29 @@ export default function CreateDatabaseDialog({
                 className="w-full"
               />
             </div>
-            <div className="grid gap-2">
-              <Label htmlFor="project" className="text-neutral-400 uppercase tracking-wider text-xs font-medium">Project</Label>
-              <Select value={projectId} onValueChange={setProjectId}>
-                <SelectTrigger className="w-full">
-                  <SelectValue placeholder="Select a project" />
-                </SelectTrigger>
-                <SelectContent>
-                  {projects.length === 0 ? (
-                    <SelectItem value="none" disabled>
-                      No projects available
-                    </SelectItem>
-                  ) : (
-                    projects.map((project) => (
-                      <SelectItem key={project.id} value={String(project.id)}>
-                        {project.name}
+            {!hideProjectSelector && (
+              <div className="grid gap-2">
+                <Label htmlFor="project" className="text-neutral-400 uppercase tracking-wider text-xs font-medium">Project</Label>
+                <Select value={projectId} onValueChange={setProjectId}>
+                  <SelectTrigger className="w-full">
+                    <SelectValue placeholder="Select a project" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {projects.length === 0 ? (
+                      <SelectItem value="none" disabled>
+                        No projects available
                       </SelectItem>
-                    ))
-                  )}
-                </SelectContent>
-              </Select>
-            </div>
+                    ) : (
+                      projects.map((project) => (
+                        <SelectItem key={project.id} value={String(project.id)}>
+                          {project.name}
+                        </SelectItem>
+                      ))
+                    )}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
 
             {type === "postgresql" && (
               <div className="grid gap-2">

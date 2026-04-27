@@ -25,15 +25,18 @@ import CreateDatabaseDialog from "@/components/database/CreateDatabaseDialog";
 import CreateProjectDialog from "@/components/project/CreateProjectDialog";
 import { useDatabase } from "@/context/DatabaseContext";
 import { useProject } from "@/context/ProjectContext";
+import { useAuth } from "@/context/AuthContext";
 import { LetterAvatar } from "@/components/ui/letter-avatar";
 
 export default function Sidebar() {
   const { selectedDatabase, setSelectedDatabase, databases, refreshDatabases } =
     useDatabase();
   const { projects, refreshProjects } = useProject();
+  const { hasPermission } = useAuth();
   const location = useLocation();
   const [createMenuOpen, setCreateMenuOpen] = useState(false);
   const [selectorOpen, setSelectorOpen] = useState(false);
+  const canManageBackups = hasPermission("manage_backups");
 
   useEffect(() => {
     const pathParts = location.pathname.split("/");
@@ -411,28 +414,34 @@ export default function Sidebar() {
                   <span>Tables</span>
                 </Link>
               </li>
-              <li
-                className={`py-1.5 px-2.5 rounded-md ${
-                  location.pathname ===
-                  (selectedDatabase ? `/db/${selectedDatabase.id}/backup` : "/")
-                    ? "bg-muted/50"
-                    : ""
-                }`}
-              >
-                <Link
-                  to={
-                    selectedDatabase ? `/db/${selectedDatabase.id}/backup` : "/"
-                  }
-                  className="text-neutral-100 text-sm flex flex-row items-center gap-2"
+              {canManageBackups && (
+                <li
+                  className={`py-1.5 px-2.5 rounded-md ${
+                    location.pathname ===
+                    (selectedDatabase
+                      ? `/db/${selectedDatabase.id}/backup`
+                      : "/")
+                      ? "bg-muted/50"
+                      : ""
+                  }`}
                 >
-                  <ClockCounterClockwiseIcon
-                    size={18}
-                    weight="bold"
-                    className="text-neutral-400"
-                  />
-                  <span>Backup</span>
-                </Link>
-              </li>
+                  <Link
+                    to={
+                      selectedDatabase
+                        ? `/db/${selectedDatabase.id}/backup`
+                        : "/"
+                    }
+                    className="text-neutral-100 text-sm flex flex-row items-center gap-2"
+                  >
+                    <ClockCounterClockwiseIcon
+                      size={18}
+                      weight="bold"
+                      className="text-neutral-400"
+                    />
+                    <span>Backup</span>
+                  </Link>
+                </li>
+              )}
             </ul>
           </div>
         )}

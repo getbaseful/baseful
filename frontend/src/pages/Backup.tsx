@@ -51,7 +51,11 @@ interface BackupSettings {
   bucket: string;
   access_key: string;
   secret_key: string;
+  has_access_key?: boolean;
+  has_secret_key?: boolean;
   path_prefix: string;
+  automation_enabled: boolean;
+  automation_frequency: string;
   encryption_enabled: boolean;
   encryption_public_key: string;
 }
@@ -70,12 +74,23 @@ interface Backup {
 
 type BackupSection = "overview" | "settings" | "external";
 type DecryptMode = "download" | "restore";
+type AutomationDraft = {
+  automation_enabled: boolean;
+  automation_frequency: string;
+};
+
+const AUTOMATION_FREQUENCY_OPTIONS = [
+  { value: "hourly", label: "Every hour" },
+  { value: "daily", label: "Every day" },
+  { value: "weekly", label: "Every week" },
+];
 
 export default function Backup() {
   const { id } = useParams<{ id: string }>();
   const queryClient = useQueryClient();
   const { selectedDatabase } = useDatabase();
-  const { token, logout } = useAuth();
+  const { token, logout, user, hasPermission } = useAuth();
+  const canManageBackups = user?.isAdmin || hasPermission("manage_backups");
 
   const [settingsForm, setSettingsForm] = useState<BackupSettings>({
     database_id: parseInt(id || "0"),
@@ -86,7 +101,11 @@ export default function Backup() {
     bucket: "",
     access_key: "",
     secret_key: "",
+    has_access_key: false,
+    has_secret_key: false,
     path_prefix: "/baseful/backups",
+    automation_enabled: false,
+    automation_frequency: "daily",
     encryption_enabled: false,
     encryption_public_key: "",
   });
@@ -103,7 +122,7 @@ export default function Backup() {
       if (!res.ok) throw new Error("Failed to fetch settings");
       return res.json() as Promise<BackupSettings>;
     },
-    enabled: !!id && !!token,
+    enabled: !!id && !!token && canManageBackups,
   });
 
   useEffect(() => {
@@ -124,7 +143,7 @@ export default function Backup() {
       if (!res.ok) throw new Error("Failed to fetch backups");
       return res.json() as Promise<Backup[]>;
     },
-    enabled: !!id && !!token,
+    enabled: !!id && !!token && canManageBackups,
     refetchInterval: 5000,
   });
 
@@ -186,6 +205,11 @@ export default function Backup() {
   const [passphraseInput, setPassphraseInput] = useState("");
   const [decryptLoading, setDecryptLoading] = useState(false);
   const [keyGuideOpen, setKeyGuideOpen] = useState(false);
+  const [automationDialogOpen, setAutomationDialogOpen] = useState(false);
+  const [automationDraft, setAutomationDraft] = useState<AutomationDraft>({
+    automation_enabled: false,
+    automation_frequency: "daily",
+  });
 
   const hasSettingsChanges = useMemo(() => {
     if (!settings) return false;
@@ -198,6 +222,8 @@ export default function Backup() {
       access_key: value.access_key || "",
       secret_key: value.secret_key || "",
       path_prefix: value.path_prefix || "",
+      automation_enabled: !!value.automation_enabled,
+      automation_frequency: value.automation_frequency || "daily",
       encryption_public_key: value.encryption_public_key || "",
       encryption_enabled: !!value.encryption_enabled,
       enabled: !!value.enabled,
@@ -312,6 +338,20 @@ export default function Backup() {
     }
   };
 
+  if (!canManageBackups) {
+    return (
+      <div className="min-h-screen bg-background text-foreground p-6">
+        <div className="mx-auto max-w-xl rounded-xl border border-border bg-card p-6">
+          <h1 className="text-lg font-semibold">Backup Access Required</h1>
+          <p className="mt-2 text-sm text-muted-foreground">
+            You do not have permission to view or manage backup configuration
+            for this database.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   const handleSaveSettings = () => {
     if (
       settingsForm.encryption_enabled &&
@@ -327,6 +367,33 @@ export default function Backup() {
     if (!settings) return;
     setSettingsForm(settings);
   };
+
+  const openAutomationDialog = () => {
+    if (!settingsForm.enabled) {
+      return;
+    }
+
+    setAutomationDraft({
+      automation_enabled: settingsForm.automation_enabled,
+      automation_frequency: settingsForm.automation_frequency || "daily",
+    });
+    setAutomationDialogOpen(true);
+  };
+
+  const applyAutomationSettings = () => {
+    setSettingsForm((prev) => ({
+      ...prev,
+      automation_enabled: automationDraft.automation_enabled,
+      automation_frequency: automationDraft.automation_frequency || "daily",
+    }));
+    setAutomationDialogOpen(false);
+  };
+
+  useEffect(() => {
+    if (!settingsForm.enabled) {
+      setAutomationDialogOpen(false);
+    }
+  }, [settingsForm.enabled]);
 
   const openDecryptDialog = (backup: Backup, mode: DecryptMode) => {
     setTargetBackup(backup);
@@ -710,6 +777,37 @@ export default function Backup() {
                 </div>
               </div>
 
+              <div className="border border-border rounded-xl bg-card p-5 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                <div>
+                  <h3 className="text-lg font-medium text-neutral-100">
+                    Automated Backups
+                  </h3>
+                  <p className="text-sm text-neutral-500 mt-1">
+                    Save how often Baseful should trigger recurring backups. The
+                    execution logic will be connected later.
+                  </p>
+                </div>
+                <div className="flex flex-col items-start gap-2 md:items-end">
+                  <div className="text-xs text-neutral-400">
+                    {settingsForm.automation_enabled
+                      ? `Scheduled ${AUTOMATION_FREQUENCY_OPTIONS.find((option) => option.value === settingsForm.automation_frequency)?.label.toLowerCase() || "daily"}`
+                      : "Automation disabled"}
+                  </div>
+                  <Button
+                    variant="outline"
+                    onClick={openAutomationDialog}
+                    disabled={!settingsForm.enabled}
+                  >
+                    Configure Automation
+                  </Button>
+                  {!settingsForm.enabled && (
+                    <span className="text-[11px] text-neutral-500">
+                      Enable backups first to configure automation.
+                    </span>
+                  )}
+                </div>
+              </div>
+
               <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
                 <div className="border border-border rounded-xl bg-card p-5 space-y-4">
                   <div>
@@ -839,6 +937,11 @@ export default function Backup() {
                           access_key: e.target.value,
                         })
                       }
+                      placeholder={
+                        settings?.has_access_key
+                          ? "Stored securely. Enter a new key to replace it."
+                          : ""
+                      }
                     />
                   </div>
                   <div className="space-y-2">
@@ -853,6 +956,11 @@ export default function Backup() {
                           ...settingsForm,
                           secret_key: e.target.value,
                         })
+                      }
+                      placeholder={
+                        settings?.has_secret_key
+                          ? "Stored securely. Enter a new secret to replace it."
+                          : ""
                       }
                     />
                   </div>
@@ -1172,6 +1280,88 @@ gpg --decrypt backup.sql.gpg > backup.sql`}
               </pre>
             </section>
           </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={automationDialogOpen}
+        onOpenChange={(open) => {
+          if (!settingsForm.enabled) {
+            setAutomationDialogOpen(false);
+            return;
+          }
+          setAutomationDialogOpen(open);
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Automated Backups</DialogTitle>
+            <DialogDescription>
+              Store whether recurring backups are enabled for this database and
+              how often they should run.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-5">
+            <div className="flex items-center justify-between rounded-lg border border-border bg-neutral-900 px-4 py-3">
+              <div>
+                <p className="text-sm text-neutral-200">Enable automation</p>
+                <p className="text-[11px] text-neutral-500 mt-1">
+                  Keeps the schedule saved for the worker we will add later.
+                </p>
+              </div>
+              <Switch
+                checked={automationDraft.automation_enabled}
+                onCheckedChange={(checked: boolean) =>
+                  setAutomationDraft((prev) => ({
+                    ...prev,
+                    automation_enabled: checked,
+                  }))
+                }
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-medium text-neutral-400">
+                Backup frequency
+              </label>
+              <Select
+                value={automationDraft.automation_frequency}
+                onValueChange={(value) =>
+                  setAutomationDraft((prev) => ({
+                    ...prev,
+                    automation_frequency: value,
+                  }))
+                }
+                disabled={!automationDraft.automation_enabled}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder="Select frequency" />
+                </SelectTrigger>
+                <SelectContent>
+                  {AUTOMATION_FREQUENCY_OPTIONS.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-[11px] text-neutral-500">
+                This only stores configuration right now. No recurring jobs are
+                executed yet.
+              </p>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setAutomationDialogOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button onClick={applyAutomationSettings}>Save Automation</Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 

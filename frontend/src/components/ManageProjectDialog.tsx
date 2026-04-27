@@ -140,6 +140,10 @@ export function ManageProjectDialog({
     };
 
     const toggleUserAccess = (userId: number) => {
+        if (currentUser?.isAdmin && currentUser.id === userId) {
+            return;
+        }
+
         setProjectUsers((prev) =>
             prev.includes(userId)
                 ? prev.filter((id) => id !== userId)
@@ -191,32 +195,37 @@ export function ManageProjectDialog({
                                 <p className="text-sm text-neutral-500">No users found.</p>
                             ) : (
                                 <div className="max-h-60 overflow-y-auto space-y-2 rounded-md border border-neutral-800 p-3 bg-neutral-900/50">
-                                    {allUsers.map((u) => (
-                                        <label
-                                            key={u.id}
-                                            className="flex items-center gap-3 text-sm text-neutral-300 hover:text-white cursor-pointer"
-                                        >
-                                            <input
-                                                type="checkbox"
-                                                checked={projectUsers.includes(u.id)}
-                                                onChange={() => toggleUserAccess(u.id)}
-                                                className="accent-blue-500 w-4 h-4 rounded bg-neutral-800 border-neutral-700"
-                                            />
-                                            <div className="flex items-center gap-2">
-                                                <div className="w-6 h-6 rounded-full flex items-center justify-center overflow-hidden bg-muted bg-blue-500/10 text-blue-400">
-                                                    {u.avatarUrl ? (
-                                                        <img src={u.avatarUrl} className="size-full object-cover" alt="" />
-                                                    ) : (
-                                                        <LetterAvatar
-                                                            name={u.email}
-                                                            size={24}
-                                                        />
-                                                    )}
+                                    {allUsers.map((u) => {
+                                        const isCurrentAdmin = currentUser?.isAdmin && currentUser.id === u.id;
+
+                                        return (
+                                            <label
+                                                key={u.id}
+                                                className={`flex items-center gap-3 text-sm text-neutral-300 ${isCurrentAdmin ? "cursor-not-allowed opacity-70" : "cursor-pointer hover:text-white"}`}
+                                            >
+                                                <input
+                                                    type="checkbox"
+                                                    checked={projectUsers.includes(u.id)}
+                                                    disabled={Boolean(isCurrentAdmin)}
+                                                    onChange={() => toggleUserAccess(u.id)}
+                                                    className="accent-blue-500 w-4 h-4 rounded bg-neutral-800 border-neutral-700 disabled:cursor-not-allowed disabled:opacity-60"
+                                                />
+                                                <div className="flex items-center gap-2">
+                                                    <div className="w-6 h-6 rounded-full flex items-center justify-center overflow-hidden bg-muted bg-blue-500/10 text-blue-400">
+                                                        {u.avatarUrl ? (
+                                                            <img src={u.avatarUrl} className="size-full object-cover" alt="" />
+                                                        ) : (
+                                                            <LetterAvatar
+                                                                name={u.email}
+                                                                size={24}
+                                                            />
+                                                        )}
+                                                    </div>
+                                                    <span className="font-medium text-xs">{u.email}</span>
                                                 </div>
-                                                <span className="font-medium text-xs">{u.email}</span>
-                                            </div>
-                                        </label>
-                                    ))}
+                                            </label>
+                                        );
+                                    })}
                                 </div>
                             )}
                         </div>

@@ -25,9 +25,9 @@ func md5Hash(password, user string, salt []byte) string {
 }
 
 // SCRAM-SHA-256 Helpers using xdg-go/scram
-func (p *ProxyServer) handleSCRAMAuth(backend net.Conn, mechanisms []byte, password string) error {
+func (p *ProxyServer) handleSCRAMAuth(backend net.Conn, mechanisms []byte, username, password string) error {
 	// 1. Initial SCRAM Exchange (ClientFirst)
-	client, err := scram.SHA256.NewClient("postgres", password, "")
+	client, err := scram.SHA256.NewClient(username, password, "")
 	if err != nil {
 		return err
 	}
