@@ -10,6 +10,7 @@ import (
 	"baseful/db"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
 )
@@ -205,6 +206,49 @@ func secureLegacyBindingsForDatabase(ctx context.Context, cli *client.Client, da
 	return result, nil
 }
 
+func buildReplacementMounts(inspect container.InspectResponse) ([]mount.Mount, error) {
+	mounts := make([]mount.Mount, 0, len(inspect.Mounts))
+	for _, current := range inspect.Mounts {
+		target := current.Destination
+		if strings.TrimSpace(target) == "" {
+			continue
+		}
+
+		switch current.Type {
+		case mount.TypeVolume:
+			source := current.Name
+			if strings.TrimSpace(source) == "" {
+				return nil, fmt.Errorf("volume mount for %s has no volume name", target)
+			}
+			mounts = append(mounts, mount.Mount{
+				Type:     mount.TypeVolume,
+				Source:   source,
+				Target:   target,
+				ReadOnly: !current.RW,
+			})
+		case mount.TypeBind:
+			source := current.Source
+			if strings.TrimSpace(source) == "" {
+				return nil, fmt.Errorf("bind mount for %s has no source path", target)
+			}
+			mounts = append(mounts, mount.Mount{
+				Type:     mount.TypeBind,
+				Source:   source,
+				Target:   target,
+				ReadOnly: !current.RW,
+			})
+		case mount.TypeTmpfs:
+			mounts = append(mounts, mount.Mount{
+				Type:   mount.TypeTmpfs,
+				Target: target,
+			})
+		default:
+			return nil, fmt.Errorf("unsupported mount type %q for %s", current.Type, target)
+		}
+	}
+	return mounts, nil
+}
+
 func migrateLegacyBindingScope(ctx context.Context, cli *client.Client, scope legacyBindingScope, inspect container.InspectResponse) error {
 	publicBinding, legacy := getLegacyPublicPostgresBinding(inspect)
 	if !legacy {
@@ -224,6 +268,10 @@ func migrateLegacyBindingScope(ctx context.Context, cli *client.Client, scope le
 	hostPortValue, _ := strconv.Atoi(hostPort)
 	if hostPortValue == 0 {
 		hostPortValue = scope.HostPortHint
+	}
+	replacementMounts, err := buildReplacementMounts(inspect)
+	if err != nil {
+		return fmt.Errorf("failed to preserve container storage: %w", err)
 	}
 
 	originalName := strings.TrimPrefix(inspect.Name, "/")
@@ -277,14 +325,6 @@ func migrateLegacyBindingScope(ctx context.Context, cli *client.Client, scope le
 		}
 	}
 
-	commitResp, err := cli.ContainerCommit(ctx, scope.ContainerID, container.CommitOptions{Pause: false})
-	if err != nil {
-		if wasRunning {
-			_ = cli.ContainerStart(ctx, scope.ContainerID, container.StartOptions{})
-		}
-		return fmt.Errorf("failed to snapshot original container: %w", err)
-	}
-
 	if err := cli.ContainerRename(ctx, scope.ContainerID, backupName); err != nil {
 		if wasRunning {
 			_ = cli.ContainerStart(ctx, scope.ContainerID, container.StartOptions{})
@@ -294,10 +334,10 @@ func migrateLegacyBindingScope(ctx context.Context, cli *client.Client, scope le
 	renamedOld = true
 
 	configCopy := *inspect.Config
-	configCopy.Image = commitResp.ID
 
 	hostConfig := &container.HostConfig{
 		NetworkMode: inspect.HostConfig.NetworkMode,
+		Mounts:      replacementMounts,
 		PortBindings: nat.PortMap{
 			nat.Port("5432/tcp"): []nat.PortBinding{{
 				HostIP:   getDatabaseHostBindIP(),
@@ -309,7 +349,7 @@ func migrateLegacyBindingScope(ctx context.Context, cli *client.Client, scope le
 		SecurityOpt:   append([]string(nil), inspect.HostConfig.SecurityOpt...),
 		CapDrop:       append([]string(nil), inspect.HostConfig.CapDrop...),
 		CapAdd:        append([]string(nil), inspect.HostConfig.CapAdd...),
-		Binds:         append([]string(nil), inspect.HostConfig.Binds...),
+		Tmpfs:         inspect.HostConfig.Tmpfs,
 	}
 
 	created, err := cli.ContainerCreate(ctx, &configCopy, hostConfig, nil, nil, originalName)
