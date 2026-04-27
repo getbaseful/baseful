@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"baseful/db"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -287,17 +288,45 @@ func GetProxyPort() string {
 	return port
 }
 
+func getSavedDomainName() string {
+	domain, err := db.GetSetting("domain_name")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(domain)
+}
+
+func isProxyHostPlaceholder(host string) bool {
+	trimmed := strings.TrimSpace(strings.Trim(host, "[]"))
+	switch strings.ToLower(trimmed) {
+	case "", "0.0.0.0", "::", "localhost", "127.0.0.1", "::1":
+		return true
+	default:
+		return false
+	}
+}
+
 // GetProxyHost returns the PostgreSQL proxy host from environment
 func GetProxyHost() string {
-	host := os.Getenv("PROXY_HOST")
-	if host == "" {
-		host = os.Getenv("DOMAIN_NAME")
+	host := strings.TrimSpace(os.Getenv("PROXY_HOST"))
+	domainName := strings.TrimSpace(os.Getenv("DOMAIN_NAME"))
+	publicIP := strings.TrimSpace(os.Getenv("PUBLIC_IP"))
+	savedDomain := getSavedDomainName()
+
+	if !isProxyHostPlaceholder(host) && (publicIP == "" || host != publicIP) {
+		return host
 	}
-	if host == "" {
-		host = os.Getenv("PUBLIC_IP")
+	if domainName != "" {
+		return domainName
 	}
-	if host == "" {
-		return "localhost"
+	if savedDomain != "" {
+		return savedDomain
 	}
-	return host
+	if !isProxyHostPlaceholder(host) {
+		return host
+	}
+	if publicIP != "" {
+		return publicIP
+	}
+	return "localhost"
 }

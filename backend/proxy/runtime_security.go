@@ -23,10 +23,10 @@ func normalizeRemoteIP(remoteAddr string) string {
 
 func getExpectedTLSHost() string {
 	for _, candidate := range []string{
+		auth.GetProxyHost(),
 		strings.TrimSpace(os.Getenv("PROXY_HOST")),
 		strings.TrimSpace(os.Getenv("DOMAIN_NAME")),
 		strings.TrimSpace(os.Getenv("PUBLIC_IP")),
-		strings.TrimSpace(auth.GetProxyHost()),
 	} {
 		if candidate != "" {
 			return strings.Trim(candidate, "[]")

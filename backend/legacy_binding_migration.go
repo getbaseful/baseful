@@ -398,11 +398,7 @@ func migrateLegacyBindingScope(ctx context.Context, cli *client.Client, scope le
 		}
 	}
 
-	if err := cli.ContainerRemove(ctx, scope.ContainerID, container.RemoveOptions{Force: true}); err != nil {
-		// The secured replacement is already active; keep moving and let operators
-		// clean up the backup container manually if removal fails.
-		fmt.Printf("Warning: failed to remove legacy backup container %s: %v\n", backupName, err)
-	}
+	fmt.Printf("Retained legacy backup container %s after securing %s. Remove it manually after verifying the replacement.\n", backupName, scope.label())
 
 	return nil
 }

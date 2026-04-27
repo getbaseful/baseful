@@ -170,6 +170,21 @@ func GetDomainInfo() (*DomainInfo, error) {
 }
 
 func SaveDomain(domain string) error {
+	trimmedDomain := strings.TrimSpace(domain)
+	if trimmedDomain != "" {
+		_ = os.Setenv("DOMAIN_NAME", trimmedDomain)
+
+		proxyHost := strings.TrimSpace(os.Getenv("PROXY_HOST"))
+		publicIP := strings.TrimSpace(os.Getenv("PUBLIC_IP"))
+		switch strings.Trim(strings.ToLower(proxyHost), "[]") {
+		case "", "0.0.0.0", "::", "localhost", "127.0.0.1", "::1":
+			_ = os.Setenv("PROXY_HOST", trimmedDomain)
+		default:
+			if publicIP != "" && proxyHost == publicIP {
+				_ = os.Setenv("PROXY_HOST", trimmedDomain)
+			}
+		}
+	}
 	if err := updateEnvFile(domain); err != nil {
 		fmt.Printf("Warning: Failed to update .env file: %v\n", err)
 	}

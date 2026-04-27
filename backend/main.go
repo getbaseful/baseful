@@ -127,6 +127,32 @@ func recommendedProxySSLMode(host string) string {
 	return auth.RecommendedProxySSLMode(host)
 }
 
+func syncPublicProxyEnvFromSavedDomain() {
+	domain, err := db.GetSetting("domain_name")
+	if err != nil {
+		return
+	}
+	domain = strings.TrimSpace(domain)
+	if domain == "" {
+		return
+	}
+
+	if strings.TrimSpace(os.Getenv("DOMAIN_NAME")) == "" {
+		_ = os.Setenv("DOMAIN_NAME", domain)
+	}
+
+	proxyHost := strings.TrimSpace(os.Getenv("PROXY_HOST"))
+	publicIP := strings.TrimSpace(os.Getenv("PUBLIC_IP"))
+	switch strings.Trim(strings.ToLower(proxyHost), "[]") {
+	case "", "0.0.0.0", "::", "localhost", "127.0.0.1", "::1":
+		_ = os.Setenv("PROXY_HOST", domain)
+	default:
+		if publicIP != "" && proxyHost == publicIP {
+			_ = os.Setenv("PROXY_HOST", domain)
+		}
+	}
+}
+
 func readProxyLogTail(logPath string, tail int) ([]string, error) {
 	file, err := os.Open(logPath)
 	if err != nil {
@@ -742,6 +768,7 @@ func main() {
 	if err := db.InitDB(); err != nil {
 		panic(err)
 	}
+	syncPublicProxyEnvFromSavedDomain()
 	if err := backups.MigrateLegacyTopologyBackupCardProfiles(); err != nil {
 		fmt.Printf("Warning: Failed to migrate legacy backup card profiles: %v\n", err)
 	}
